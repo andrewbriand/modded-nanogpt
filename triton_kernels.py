@@ -501,7 +501,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             n_rows, n_cols, n_predict,
             A, B, C,
             BLOCK_SIZE=1024,
-            num_warps=8,
+            num_warps=2,
             num_stages=4
         )
         
@@ -526,7 +526,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             n_rows, n_cols, n_predict,
             A, B, C,
             BLOCK_SIZE=1024,
-            num_warps=8,
+            num_warps=2,
             num_stages=4
         )
         return grad_input, None, None, None, None, None
