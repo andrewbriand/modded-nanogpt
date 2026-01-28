@@ -1,5 +1,6 @@
 import os
 import sys
+from flash_attn import flash_attn_varlen_func
 
 # Read the current file and the kernels file code ASAP, for logging
 with open(sys.argv[0], 'r') as f: 
@@ -20,6 +21,7 @@ from pathlib import Path
 import gc
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+#print("TRITON_PRINT_AUTOTUNING:", os.environ["TRITON_PRINT_AUTOTUNING"])
 import torch
 import triton
 
@@ -803,7 +805,7 @@ class CastedLinearT(nn.Module):
             nn.init.zeros_(self.weight) # @Grad62304977 and others
 
     def forward(self, x: Tensor):
-        if self.use_fp8 and self.training:
+        if False and self.use_fp8 and self.training:
             _x = x.flatten(0, -2)
             out = torch.ops.nanogpt.mm_t(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
@@ -923,7 +925,7 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+#flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
@@ -960,7 +962,7 @@ class CausalSelfAttention(nn.Module):
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        y = flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
@@ -1017,7 +1019,7 @@ class PairedHeadCausalSelfAttention(nn.Module):
         seqlens = 2 * seqlens
         max_len = 2 * max_len
 
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        y = flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
@@ -1035,7 +1037,11 @@ class MLP(nn.Module):
         # relu(x)^2:
         # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
-        return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
+        x = F.linear(x, c_fc.type_as(x))
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = F.linear(x, c_proj.T.type_as(x))
+        return x
+        #return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
 
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
@@ -1291,11 +1297,13 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
+        USE_SOFTCAPPING = False
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights)
+            losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights, USE_SOFTCAPPING)
             loss = losses.sum()
         else:
-            logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+            if USE_SOFTCAPPING:
+                logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
             loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
         return loss
@@ -1728,8 +1736,8 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1560  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1560 + 90  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 40 + 10  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
@@ -1755,7 +1763,7 @@ args.val_files = os.path.join(data_path, args.val_files)
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+grad_accum_steps = 4 * 8 // world_size
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -1826,18 +1834,32 @@ transition_steps = training_manager.get_transition_steps()
 # first few steps plus transitions
 warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0)) 
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
-for step in warmup_steps:
-    training_manager.advance_schedule(step)
-    model.eval()
-    with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-    model.train()
-    for idx in range(grad_accum_steps):
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
-    training_manager.step_optimizers(step)
+for i in range(1):
+    if i == 1:
+        torch.cuda.cudart().cudaProfilerStart()
+    for step in warmup_steps:
+        training_manager.advance_schedule(step)
+
+        #print("model.eval():")
+        model.eval()
+        #print("model forward:")
+        with torch.no_grad():
+            inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+            model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        #print("model.train():")
+        model.train()
+        #print("model grad accum steps:")
+        for idx in range(grad_accum_steps):
+            #print(f"step {idx}")
+            send_args = training_manager.train_loader_send_args
+            #print("train loader")
+            inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
+            #print("model")
+            (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        #print("step optimizers")
+        training_manager.step_optimizers(step)
+    if i == 1:
+        torch.cuda.cudart().cudaProfilerStop()
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])

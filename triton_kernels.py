@@ -400,7 +400,8 @@ def fused_softcapped_entropy_fwd_kernel(
     stride_logits_n, stride_logits_v,
     n_rows, n_cols, n_predict,
     A, B, C,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE: tl.constexpr,
+    USE_SOFTCAPPING: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
     logits_row_ptr = logits_ptr + row_idx * stride_logits_n
@@ -412,7 +413,10 @@ def fused_softcapped_entropy_fwd_kernel(
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
-        z = A * tl.sigmoid((val + B) / C)
+        if USE_SOFTCAPPING:
+            z = A * tl.sigmoid((val + B) / C)
+        else:
+            z = val
         z = tl.where(mask, z, -float('inf'))
         curr_max = tl.max(z, axis=0)
         new_max = tl.maximum(max_val, curr_max)
@@ -431,7 +435,10 @@ def fused_softcapped_entropy_fwd_kernel(
                 target = tl.load(targets_ptr + target_idx).to(tl.int32)
                 if target >= 0 and target < n_cols:
                     val_target = tl.load(logits_row_ptr + target).to(tl.float32)
-                    z_target = A * tl.sigmoid((val_target + B) / C)
+                    if USE_SOFTCAPPING:
+                        z_target = A * tl.sigmoid((val_target + B) / C)
+                    else:
+                        z_target = val_target
                     total_loss += weight * (lse - z_target)
     
     tl.store(losses_ptr + row_idx, total_loss)
@@ -442,7 +449,8 @@ def fused_softcapped_entropy_bwd_kernel(
     stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
     n_rows, n_cols, n_predict,
     A, B, C,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE: tl.constexpr,
+    USE_SOFTCAPPING: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
 
@@ -461,9 +469,12 @@ def fused_softcapped_entropy_bwd_kernel(
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        u = (val + B) / C
-        sigmoid_u = tl.sigmoid(u)
-        z = A * sigmoid_u
+        if USE_SOFTCAPPING:
+            u = (val + B) / C
+            sigmoid_u = tl.sigmoid(u)
+            z = A * sigmoid_u
+        else:
+            z = val
         p = tl.exp(z - lse)
         
         term1 = S_w * p
@@ -475,13 +486,16 @@ def fused_softcapped_entropy_bwd_kernel(
                 term2 += tl.where(cols == target, weight, 0.0)
         
         grad_z = grad_loss * (term1 - term2)
-        dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
+        if USE_SOFTCAPPING:
+            dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
+        else:
+            dz_dx = 1
         grad_x = grad_z * dz_dx
         tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, logits, targets, mtp_weights, USE_SOFTCAPPING, A=23.0, B=5.0, C=7.5):
         n_rows, n_cols = logits.shape
         if mtp_weights is None:
              mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
@@ -501,18 +515,19 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             n_rows, n_cols, n_predict,
             A, B, C,
             BLOCK_SIZE=1024,
+            USE_SOFTCAPPING=USE_SOFTCAPPING,
             num_warps=8,
             num_stages=4
         )
         
         ctx.save_for_backward(logits, targets, mtp_weights, lse)
-        ctx.params = (A, B, C)
+        ctx.params = (A, B, C, USE_SOFTCAPPING)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
         logits, targets, mtp_weights, lse = ctx.saved_tensors
-        A, B, C = ctx.params
+        A, B, C, USE_SOFTCAPPING = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
         
@@ -526,6 +541,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             n_rows, n_cols, n_predict,
             A, B, C,
             BLOCK_SIZE=1024,
+            USE_SOFTCAPPING=USE_SOFTCAPPING,
             num_warps=8,
             num_stages=4
         )
