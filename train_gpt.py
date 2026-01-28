@@ -805,7 +805,7 @@ class CastedLinearT(nn.Module):
             nn.init.zeros_(self.weight) # @Grad62304977 and others
 
     def forward(self, x: Tensor):
-        if False and self.use_fp8 and self.training:
+        if self.use_fp8 and self.training:
             _x = x.flatten(0, -2)
             out = torch.ops.nanogpt.mm_t(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
@@ -1114,7 +1114,7 @@ class GPT(nn.Module):
         self.mlp_layer_indices = list(range(num_layers))
 
         hdim = num_heads * head_dim
-        mlp_hdim = 4 * model_dim
+        mlp_hdim = 4 * 768#4 * model_dim
 
         # Create index mappings: layer_idx -> bank_idx
         self.layer_to_attn_idx = {layer_idx: bank_idx for bank_idx, layer_idx in enumerate(self.attn_layer_indices)}
@@ -1228,6 +1228,7 @@ class GPT(nn.Module):
         short_bm = ws_short * args.block_size
         long_bm = ws_long * args.block_size
         bm_sizes = [short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
+        #bm_sizes = [short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, long_bm]
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==long_bm for b in bm_sizes] # apply partial key offset to long windows
 
@@ -1297,7 +1298,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
-        USE_SOFTCAPPING = False
+        USE_SOFTCAPPING = True
         if self.training:
             losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights, USE_SOFTCAPPING)
             loss = losses.sum()
@@ -1736,8 +1737,8 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1560 + 90  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40 + 10  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1460  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
@@ -1802,9 +1803,9 @@ print0("="*100)
 model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=11,
-    num_heads=6,
+    num_heads=6 + 2,
     head_dim=128,
-    model_dim=768,
+    model_dim=768 + 256,
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
 ).cuda()
 for m in model.modules():
