@@ -1737,7 +1737,7 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1460  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1360  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1803,9 +1803,9 @@ print0("="*100)
 model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=11,
-    num_heads=6 + 2,
+    num_heads=6 + 1 * 2,
     head_dim=128,
-    model_dim=768 + 256,
+    model_dim=768 + 1 * 256,
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
 ).cuda()
 for m in model.modules():
