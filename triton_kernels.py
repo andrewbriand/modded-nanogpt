@@ -520,7 +520,25 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
         pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
-        x3 = post @ W2
+
+        post_s = post.abs().max(dim=-1, keepdim=True)[0].to(torch.float32)
+        W2_s = W2.abs().max(dim=0, keepdim=True)[0].to(torch.float32)
+        #post_s = post.abs().max().to(torch.float32)
+        #W2_s = W2.abs().max().to(torch.float32)
+
+        eps = 1e-5
+        post_fp8 = post.div(post_s + eps).to(torch.float8_e4m3fn)
+        W2_fp8 = W2.div(W2_s + eps).to(torch.float8_e4m3fn)
+
+        x3 = torch._scaled_mm(
+            post_fp8,
+            W2_fp8.T.contiguous().T,
+            out_dtype=torch.bfloat16,
+            scale_a=post_s,
+            scale_b=W2_s,
+            use_fast_accum=True)
+
+        #x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
 
