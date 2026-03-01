@@ -541,8 +541,8 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
                 post_fp8,
                 W2_fp8.T.contiguous().T,
                 out_dtype=torch.bfloat16,
-                scale_a=post_amax_last_iter[layer_idx],
-                scale_b=W2_amax_last_iter[layer_idx],
+                scale_a=post_amax_last_iter[layer_idx:layer_idx+1],
+                scale_b=W2_amax_last_iter[layer_idx:layer_idx+1],
                 use_fast_accum=True)
 
             post_amax_last_iter[layer_idx] = post_amax_this_iter
@@ -560,7 +560,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2
+        return dx.view(x.shape), dW1, dW2, None, None, None, None, None
 
 # -----------------------------------------------------------------------------
 # Fused Softcapped Cross Entropy

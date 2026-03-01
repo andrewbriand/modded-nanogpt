@@ -1322,10 +1322,10 @@ class GPT(nn.Module):
         x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
 
         # ---- Transformer layers ----
-        is_first_iter = self.training and (W2_amax is None)
+        is_first_iter = self.training and (self.W2_amax is None)
         if is_first_iter:
-            self.W2_amax = torch.empty((num_layers,), dtype=torch.float32)
-            self.post_amax = torch.empty((num_layers,), dtype=torch.float32)
+            self.W2_amax = torch.empty((self.num_layers,), dtype=torch.float32, device=x.device)
+            self.post_amax = torch.empty((self.num_layers,), dtype=torch.float32, device=x.device)
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
