@@ -1322,7 +1322,7 @@ class GPT(nn.Module):
         x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
 
         # ---- Transformer layers ----
-        is_first_iter = self.W2_amax is None
+        is_first_iter = self.training and (W2_amax is None)
         if is_first_iter:
             self.W2_amax = torch.empty((num_layers,), dtype=torch.float32)
             self.post_amax = torch.empty((num_layers,), dtype=torch.float32)
@@ -1364,20 +1364,20 @@ class GPT(nn.Module):
             if i == 6:
                 # MLP-only layer (no attention) @YouJiacheng
                 post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj, self.post_amax, self.W2_amax, i, is_first_iter)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj, self.post_amax, self.W2_amax, i, is_first_iter, self.training)
             elif i < self.parallel_start:
                 # Single-stream: attn and mlp both read/write lane0
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
                 post_attn = lane0
-                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj, self.post_amax, self.W2_amax, i, is_first_iter)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj, self.post_amax, self.W2_amax, i, is_first_iter, self.training)
             else:
                 # Parallel: attn reads lane0, mlp reads lane1, both write to both lanes
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
                 lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
                 post_attn = lane0
-                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj, self.post_amax, self.W2_amax, i, is_first_iter)
+                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj, self.post_amax, self.W2_amax, i, is_first_iter, self.training)
                 lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
                 lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
 
