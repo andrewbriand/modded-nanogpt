@@ -518,25 +518,34 @@ def linear_relu_square(a, b, aux=None):
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2):
+    def forward(ctx, x, W1, W2, post_amax_last_iter, W2_amax_last_iter, layer_idx, is_first_iter):
+
         pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
 
-        post_s = post.abs().max(dim=-1, keepdim=True)[0].to(torch.float32)
-        W2_s = W2.abs().max(dim=0, keepdim=True)[0].to(torch.float32)
-        #post_s = post.abs().max().to(torch.float32)
-        #W2_s = W2.abs().max().to(torch.float32)
+        #post_s = post.abs().max(dim=-1, keepdim=True)[0].to(torch.float32)
+        #W2_s = W2.abs().max(dim=0, keepdim=True)[0].to(torch.float32)
 
+        post_amax_this_iter = post.abs().max().to(torch.float32)
+        W2_amax_this_iter = post.abs().max().to(torch.float32)
+
+        if is_first_iter:
+            post_amax_last_iter[layer_idx] = post_amax_this_iter
+            W2_amax_last_iter[layer_idx] = W2_amax_this_iter
+     
         eps = 1e-5
-        post_fp8 = post.div(post_s + eps).to(torch.float8_e4m3fn)
-        W2_fp8 = W2.div(W2_s + eps).to(torch.float8_e4m3fn)
+        post_fp8 = post.div(post_amax_last_iter[layer_idx] + eps).to(torch.float8_e4m3fn)
+        W2_fp8 = W2.div(W2_amax_last_iter[layer_idx] + eps).to(torch.float8_e4m3fn)
 
         x3 = torch._scaled_mm(
             post_fp8,
             W2_fp8.T.contiguous().T,
             out_dtype=torch.bfloat16,
-            scale_a=post_s,
-            scale_b=W2_s,
+            scale_a=post_amax_last_iter[layer_idx],
+            scale_b=W2_amax_last_iter[layer_idx],
             use_fast_accum=True)
+
+        post_amax_last_iter[layer_idx] = post_amax_this_iter
+        W2_amax_last_iter[layer_idx] = W2_amax_this_iter
 
         #x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
