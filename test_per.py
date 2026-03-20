@@ -4,7 +4,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 @triton.jit
-def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, output_scale, signal, scales_used,
+def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, aux_fp32, output_scale, signal, scales_used,
                                  M, N, K, num_blocks_n,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
@@ -56,9 +56,13 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, output_
         c_desc.store([offs_am_c, offs_bn_c], c0)
 
         if FORWARD:
-            c0_post = tl.maximum(c0, 0)
+
+            c0_post = tl.where(c0 > 0, c0, 0)
             c0_post = c0_post * c0_post
+            
             if OUTPUT_SCALE:
+                c0_post_fp32_bit = (c0_post.to(tl.int16, bitcast=True).to(tl.int32) << 16).to(tl.float32, bitcast=True)
+                aux_fp32.store([offs_am_c, offs_bn_c], c0_post_fp32_bit)
                 c0_amax = tl.max(c0_post.to(tl.float32), axis=-1)
                 amax = tl.maximum(amax, c0_amax)
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
@@ -72,9 +76,11 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, output_
 
         offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         if FORWARD:
-            c1_post = tl.maximum(c1, 0)
+            c1_post = tl.where(c1 > 0, c1, 0)
             c1_post = c1_post * c1_post
             if OUTPUT_SCALE:
+                c1_post_fp32_bit = (c1_post.to(tl.int16, bitcast=True).to(tl.int32) << 16).to(tl.float32, bitcast=True)
+                aux_fp32.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post_fp32_bit)
                 c1_amax = tl.max(c1_post.to(tl.float32), axis=-1)
                 amax = tl.maximum(amax, c1_amax)
                 tl.atomic_max(output_scale + offs_m, amax, sem="relaxed")
@@ -117,9 +123,9 @@ def linear_relu_square(a, b, aux=None, output_scale=None):
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 64
-    num_stages = 3 if FORWARD else 3
+    num_stages = 1 if FORWARD else 3
     num_warps = 8
 
     num_blocks_n = N // BLOCK_SIZE_N
@@ -129,6 +135,7 @@ def linear_relu_square(a, b, aux=None, output_scale=None):
         signal = torch.zeros((num_blocks_m,), dtype=torch.int32, device=a.device)
         aux_fp8 = torch.zeros((M, N), dtype=torch.float8_e4m3fn, device=a.device)
         scales_used = torch.zeros((num_blocks_m, num_blocks_n, BLOCK_SIZE_M), dtype=torch.float32, device=a.device)
+        aux_fp32 = torch.empty((M, N), dtype=torch.float32, device=a.device)
 
     
 
@@ -136,6 +143,7 @@ def linear_relu_square(a, b, aux=None, output_scale=None):
     b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
     c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
     aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+    aux_desc_fp32 = TensorDescriptor.from_tensor(aux_fp32, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
 
     def grid(META):
         return (min(
@@ -144,7 +152,7 @@ def linear_relu_square(a, b, aux=None, output_scale=None):
         ), )
 
     linear_relu_square_kernel[grid](
-        a_desc, b_desc, c_desc, aux_desc, aux_fp8, output_scale, signal, scales_used,
+        a_desc, b_desc, c_desc, aux_desc, aux_fp8, aux_desc_fp32, output_scale, signal, scales_used,
         M, N, K, num_blocks_n,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -166,6 +174,15 @@ def linear_relu_square(a, b, aux=None, output_scale=None):
         for pid_n in range(scales_used.shape[1]):
             torch.testing.assert_close(scales_used[pid_m][pid_n], output_scale[pid_m * BLOCK_SIZE_M:pid_m * BLOCK_SIZE_M + BLOCK_SIZE_M].squeeze())
 
+    aux_fp32_bit = aux.view(torch.int16).to(torch.int32).bitwise_left_shift(16).view(torch.float32)
+    print("aux_fp32_bit:", aux_fp32_bit)
+    print("aux.to(torch.float32):", aux.to(torch.float32))
+    torch.testing.assert_close(aux.to(torch.float32), aux_fp32_bit)
+    print("(aux_fp32_bit == aux.to(torch.float32)).all()", (aux_fp32_bit == aux.to(torch.float32)).all())
+    print("aux_fp32:", aux_fp32)
+    print("aux.to(torch.float32):", aux.to(torch.float32))
+    torch.testing.assert_close(aux_fp32, aux.to(torch.float32))
+
     if FORWARD:
         return c, aux, aux_fp8
     else:
@@ -185,7 +202,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         #W2_s = W2.abs().max().to(torch.float32)
         print("post_s:", post_s)
         print("post_s_kernel:", post_s_kernel)
-        #torch.testing.assert_close(post_s, post_s_kernel)
+        torch.testing.assert_close(post_s, post_s_kernel)
 
         #post_fp8 = post.div(post_s + eps).to(torch.float8_e4m3fn)
         post_fp8 = post.div(post_s_kernel + eps).to(torch.float8_e4m3fn)
@@ -194,7 +211,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         print("post_fp8:", post_fp8)
         print("post_fp8_kernel:", post_fp8_kernel)
         #torch.testing.assert_close(post.div(post_s + eps).to(torch.bfloat16), post.div(post_s_kernel + eps).to(torch.bfloat16))
-        torch.testing.assert_close(post_fp8_kernel, post.div(post_s_kernel + eps).to(torch.float8_e4m3fn))
+        #torch.testing.assert_close(post_fp8_kernel, post.div(post_s_kernel + eps).to(torch.float8_e4m3fn))
 
         torch.testing.assert_close(post_fp8, post_fp8_kernel)
 
