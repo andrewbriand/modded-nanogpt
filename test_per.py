@@ -83,12 +83,14 @@ def linear_relu_square_quantize_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8
                 amax = tl.maximum(amax, c1_amax)
                 tl.atomic_max(output_scale + offs_m, amax, sem="relaxed")
                 tl.atomic_add(signal + pid_m, 1, sem="release")
+
+            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+
+            if OUTPUT_SCALE:
                 flag = 0
                 while flag < num_blocks_n:
                     flag = tl.atomic_add(signal + pid_m, 0, sem="acquire")
                 scale = tl.load(output_scale + offs_m)
-
-            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
         if OUTPUT_SCALE:
             eps = 1e-5
