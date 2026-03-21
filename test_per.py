@@ -4,7 +4,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 @triton.jit
-def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, aux_fp32, output_scale, signal, scales_used,
+def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, output_scale, signal,
                                  M, N, K, num_blocks_n,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
@@ -61,8 +61,6 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, aux_fp3
             c0_post = c0_post * c0_post
             
             if OUTPUT_SCALE:
-                c0_post_fp32_bit = (c0_post.to(tl.int16, bitcast=True).to(tl.int32) << 16).to(tl.float32, bitcast=True)
-                aux_fp32.store([offs_am_c, offs_bn_c], c0_post_fp32_bit)
                 c0_amax = tl.max(c0_post.to(tl.float32), axis=-1)
                 amax = tl.maximum(amax, c0_amax)
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
@@ -79,8 +77,6 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, aux_fp3
             c1_post = tl.where(c1 > 0, c1, 0)
             c1_post = c1_post * c1_post
             if OUTPUT_SCALE:
-                c1_post_fp32_bit = (c1_post.to(tl.int16, bitcast=True).to(tl.int32) << 16).to(tl.float32, bitcast=True)
-                aux_fp32.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post_fp32_bit)
                 c1_amax = tl.max(c1_post.to(tl.float32), axis=-1)
                 amax = tl.maximum(amax, c1_amax)
                 tl.atomic_max(output_scale + offs_m, amax, sem="relaxed")
@@ -89,7 +85,6 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, aux_fp3
                 while flag < num_blocks_n:
                     flag = tl.atomic_add(signal + pid_m, 0, sem="acquire")
                 scale = tl.load(output_scale + offs_m)
-                tl.store(scales_used + pid_m * num_blocks_n * BLOCK_SIZE_M + pid_n * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M), scale)
 
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
@@ -133,17 +128,12 @@ def linear_relu_square(a, b, aux=None, output_scale=None):
     signal = None
     if OUTPUT_SCALE:
         signal = torch.zeros((num_blocks_m,), dtype=torch.int32, device=a.device)
-        aux_fp8 = torch.zeros((M, N), dtype=torch.float8_e4m3fn, device=a.device)
-        scales_used = torch.zeros((num_blocks_m, num_blocks_n, BLOCK_SIZE_M), dtype=torch.float32, device=a.device)
-        aux_fp32 = torch.empty((M, N), dtype=torch.float32, device=a.device)
-
-    
+        aux_fp8 = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=a.device)
 
     a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
     b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
     c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
     aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
-    aux_desc_fp32 = TensorDescriptor.from_tensor(aux_fp32, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
 
     def grid(META):
         return (min(
@@ -152,7 +142,7 @@ def linear_relu_square(a, b, aux=None, output_scale=None):
         ), )
 
     linear_relu_square_kernel[grid](
-        a_desc, b_desc, c_desc, aux_desc, aux_fp8, aux_desc_fp32, output_scale, signal, scales_used,
+        a_desc, b_desc, c_desc, aux_desc, aux_fp8, output_scale, signal,
         M, N, K, num_blocks_n,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -164,24 +154,6 @@ def linear_relu_square(a, b, aux=None, output_scale=None):
         num_stages=num_stages,
         num_warps=num_warps
     )
-
-    print("signal:", signal)
-    print("output_scale:", output_scale)
-    print("scales_used:", scales_used)
-
-    
-    #for pid_m in range(scales_used.shape[0]):
-    #    for pid_n in range(scales_used.shape[1]):
-    #        torch.testing.assert_close(scales_used[pid_m][pid_n], output_scale[pid_m * BLOCK_SIZE_M:pid_m * BLOCK_SIZE_M + BLOCK_SIZE_M].squeeze())
-
-    aux_fp32_bit = aux.view(torch.int16).to(torch.int32).bitwise_left_shift(16).view(torch.float32)
-    print("aux_fp32_bit:", aux_fp32_bit)
-    print("aux.to(torch.float32):", aux.to(torch.float32))
-    torch.testing.assert_close(aux.to(torch.float32), aux_fp32_bit)
-    print("(aux_fp32_bit == aux.to(torch.float32)).all()", (aux_fp32_bit == aux.to(torch.float32)).all())
-    print("aux_fp32:", aux_fp32)
-    print("aux.to(torch.float32):", aux.to(torch.float32))
-    torch.testing.assert_close(aux_fp32, aux.to(torch.float32))
 
     if FORWARD:
         return c, aux, aux_fp8
@@ -198,20 +170,10 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
 
         post_s = post.to(torch.float32).abs().max(dim=-1, keepdim=True)[0]
         W2_s = W2.abs().max(dim=0, keepdim=True)[0].to(torch.float32)
-        #post_s = post.abs().max().to(torch.float32)
-        #W2_s = W2.abs().max().to(torch.float32)
-        print("post_s:", post_s)
-        print("post_s_kernel:", post_s_kernel)
         torch.testing.assert_close(post_s, post_s_kernel)
 
-        #post_fp8 = post.div(post_s + eps).to(torch.float8_e4m3fn)
-        post_fp8 = post.div(post_s_kernel + eps).to(torch.float8_e4m3fn)
+        post_fp8 = post.div(post_s + eps).to(torch.float8_e4m3fn)
         W2_fp8 = W2.div(W2_s + eps).to(torch.float8_e4m3fn)
-
-        print("post_fp8:", post_fp8)
-        print("post_fp8_kernel:", post_fp8_kernel)
-        #torch.testing.assert_close(post.div(post_s + eps).to(torch.bfloat16), post.div(post_s_kernel + eps).to(torch.bfloat16))
-        #torch.testing.assert_close(post_fp8_kernel, post.div(post_s_kernel + eps).to(torch.float8_e4m3fn))
 
         torch.testing.assert_close(post_fp8.to(torch.bfloat16), post_fp8_kernel.to(torch.bfloat16), atol=1e-2, rtol=1.6e-2)
 
@@ -223,7 +185,6 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
             scale_b=W2_s,
             use_fast_accum=True)
 
-        #x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
 
