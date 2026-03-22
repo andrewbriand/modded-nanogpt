@@ -122,7 +122,7 @@ def linear_relu_square_quantize(a, b, aux=None, output_scale=None):
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = 64
     num_stages = 3 if FORWARD else 3
     num_warps = 8
