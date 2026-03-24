@@ -6,7 +6,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 import time
 
 @triton.jit
-def linear_relu_square_quantize_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, output_scale,
+def linear_relu_square_quantize_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8, aux_fp8_T, output_scale,
                                  M, N, K, num_blocks_n,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
@@ -49,6 +49,7 @@ def linear_relu_square_quantize_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8
         acc = tl.permute(acc, (0, 2, 1))
         acc0, acc1 = tl.split(acc)
 
+        eps = 1e-5
         c0 = acc0.to(dtype)
         if not FORWARD:
             c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
@@ -56,6 +57,7 @@ def linear_relu_square_quantize_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8
 
         c_desc.store([offs_am_c, offs_bn_c], c0)
 
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         if FORWARD:
 
             c0_post = tl.where(c0 > 0, c0, 0)
@@ -63,6 +65,11 @@ def linear_relu_square_quantize_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8
             
             if OUTPUT_SCALE:
                 c0_amax = tl.max(c0_post).to(tl.float32)
+                c0_amax = c0_amax + eps
+                c0_fp8 = (c0_post / c0_amax).to(tl.float8e4nv)
+                offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N // 2)
+                tl.store(aux_fp8 + (offs_m * N)[:,None] + offs_n, c0_fp8)
+                tl.store(aux_fp8_T + (offs_n * M)[None,:] + offs_m[:,None], c0_fp8)
                 tl.store(output_scale + pid_m * (N // 128) + pid_n * 2, c0_amax)
             #aux_desc.store([offs_am_c, offs_bn_c], c0_post)
 
@@ -73,28 +80,30 @@ def linear_relu_square_quantize_kernel(a_desc, b_desc, c_desc, aux_desc, aux_fp8
 
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
 
-        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         if FORWARD:
             c1_post = tl.where(c1 > 0, c1, 0)
             c1_post = c1_post * c1_post
             if OUTPUT_SCALE:
                 c1_amax = tl.max(c1_post).to(tl.float32)
+                c1_amax = c1_amax + eps
+                c1_fp8 = (c1_post / c1_amax).to(tl.float8e4nv)
+                offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N // 2)
+                tl.store(aux_fp8 + (offs_m * N)[:,None] + offs_n + BLOCK_SIZE_N // 2, c1_fp8)
+                tl.store(aux_fp8_T + ((offs_n + BLOCK_SIZE_N // 2) * M)[None,:] + offs_m[:,None], c1_fp8)
                 tl.store(output_scale + pid_m * (N // 128) + pid_n * 2 + 1, c1_amax)
 
             #aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
-        if OUTPUT_SCALE:
-            eps = 1e-5
-            c0_amax = c0_amax + eps
-            c1_amax = c1_amax + eps
+        #if OUTPUT_SCALE:
+            #c0_amax = c0_amax + eps
+            #c1_amax = c1_amax + eps
             
-            c0_fp8 = (c0_post / c0_amax).to(tl.float8e4nv)
+            #c0_fp8 = (c0_post / c0_amax).to(tl.float8e4nv)
 
-            offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N // 2)
-            tl.store(aux_fp8 + (offs_m * N)[:,None] + offs_n, c0_fp8)
+            #tl.store(aux_fp8 + (offs_m * N)[:,None] + offs_n, c0_fp8)
 
-            c1_fp8 = (c1_post / c1_amax).to(tl.float8e4nv)
-            tl.store(aux_fp8 + (offs_m * N)[:,None] + offs_n + BLOCK_SIZE_N // 2, c1_fp8)
+            #c1_fp8 = (c1_post / c1_amax).to(tl.float8e4nv)
+            #tl.store(aux_fp8 + (offs_m * N)[:,None] + offs_n + BLOCK_SIZE_N // 2, c1_fp8)
 
 
 def linear_relu_square_quantize(a, b, aux=None, OUTPUT_SCALE=True):
@@ -121,6 +130,7 @@ def linear_relu_square_quantize(a, b, aux=None, OUTPUT_SCALE=True):
     num_blocks_m = M // BLOCK_SIZE_M
     if OUTPUT_SCALE:
         aux_fp8 = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=a.device)
+        aux_fp8_T = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=a.device)
         output_scale = torch.empty((M // 128, N // 128), dtype=torch.float32, device=a.device)
 
     a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
@@ -135,7 +145,7 @@ def linear_relu_square_quantize(a, b, aux=None, OUTPUT_SCALE=True):
         ), )
 
     linear_relu_square_quantize_kernel[grid](
-        a_desc, b_desc, c_desc, aux_desc, aux_fp8, output_scale,
+        a_desc, b_desc, c_desc, aux_desc, aux_fp8, aux_fp8_T, output_scale,
         M, N, K, num_blocks_n,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -147,6 +157,10 @@ def linear_relu_square_quantize(a, b, aux=None, OUTPUT_SCALE=True):
         num_stages=num_stages,
         num_warps=num_warps
     )
+
+    #print("aux_fp8:", aux_fp8)
+    #print("aux_fp8_T.T:", aux_fp8_T.T)
+    #torch.testing.assert_close(aux_fp8, aux_fp8_T.T)
 
     if FORWARD:
         return c, aux, aux_fp8, output_scale
@@ -360,7 +374,7 @@ torch.cuda.synchronize()
 start = time.time()
 torch.cuda.cudart().cudaProfilerStart()
 for i in range(iters):
-    FusedLinearReLUSquareFunction.apply(x, W1, W2, True, True, False)
+    post = FusedLinearReLUSquareFunction.apply(x, W1, W2, True, True, False)
 torch.cuda.synchronize()
 torch.cuda.cudart().cudaProfilerStop()
 end = time.time()
