@@ -158,9 +158,6 @@ class FusedLinearReLUSquareFunctionFp8(torch.autograd.Function):
         W2_fp8, W2_s = block_quantize(W2, 128, 1)
         #W2_fp8 = W2_fp8.T.contiguous().T
 
-        print("scale_a:", W2_s.T.shape)
-        print("scale_b:", post_s.T.shape)
-
         x3 = torch._scaled_mm(
                 W2_fp8.T.contiguous(),
                 post_fp8.T,
@@ -222,3 +219,61 @@ print("W1.grad:", W1.grad)
 print("W1_fp8.grad:", W1_fp8.grad)
 print("W2.grad:", W2.grad)
 print("W2_fp8.grad:", W2_fp8.grad)
+
+warmups = 5
+iters = 100
+
+
+for i in range(warmups):
+    post = FusedLinearReLUSquareFunction.apply(x, W1, W2)
+torch.cuda.synchronize()
+
+start = time.time()
+for i in range(iters):
+    post = FusedLinearReLUSquareFunction.apply(x, W1, W2)
+torch.cuda.synchronize()
+end = time.time()
+elapsed = ((end - start) * 1e6) / iters
+
+print("Baseline fwd (us):", elapsed)
+
+for i in range(warmups):
+    post_fp8 = FusedLinearReLUSquareFunctionFp8.apply(x, W1, W2)
+torch.cuda.synchronize()
+
+start = time.time()
+for i in range(iters):
+    post_fp8 = FusedLinearReLUSquareFunctionFp8.apply(x, W1, W2)
+torch.cuda.synchronize()
+end = time.time()
+elapsed = ((end - start) * 1e6) / iters
+print("Fp8 fwd (us):", elapsed)
+
+for i in range(warmups):
+    post.backward(grad, retain_graph=True)
+torch.cuda.synchronize()
+
+start = time.time()
+for i in range(iters):
+    post.backward(grad, retain_graph=True)
+torch.cuda.synchronize()
+end = time.time()
+elapsed = ((end - start) * 1e6) / iters
+
+print("Baseline bwd (us):", elapsed)
+
+for i in range(warmups):
+    post_fp8.backward(grad, retain_graph=True)
+torch.cuda.synchronize()
+
+start = time.time()
+for i in range(iters):
+    post_fp8.backward(grad, retain_graph=True)
+torch.cuda.synchronize()
+end = time.time()
+elapsed = ((end - start) * 1e6) / iters
+print("Fp8 bwd (us):", elapsed)
+
+
+
+
