@@ -139,45 +139,53 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         dx = dpre @ W1
         return dx.view(x.shape), dW1, dW2
 
-def block_quantize(x, BLOCKSIZE_M, BLOCKSIZE_N):
+def block_quantize(x, BLOCKSIZE_M, BLOCKSIZE_N, dtype=torch.float8_e4m3fn):
     x_blocked = x.reshape((x.shape[0] // BLOCKSIZE_M, BLOCKSIZE_M, x.shape[1] // BLOCKSIZE_N, BLOCKSIZE_N))
     
     
     x_blocked_scales = torch.amax(x_blocked.abs(), dim=(1,3), keepdim=True)
-    x_blocked_fp8 = (x_blocked / x_blocked_scales).to(torch.float8_e4m3fn)
+    x_blocked_fp8 = (x_blocked / x_blocked_scales).to(dtype)
 
     return x_blocked_fp8.reshape(x.shape), x_blocked_scales.squeeze().to(torch.float32)
 
 class FusedLinearReLUSquareFunctionFp8(torch.autograd.Function):
+    @torch.compile
     @staticmethod
     def forward(ctx, x, W1, W2):
         pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
 
         post_fp8, post_s = block_quantize(post, 128, 128)
         W2_fp8, W2_s = block_quantize(W2, 128, 1)
+        #W2_fp8 = W2_fp8.T.contiguous().T
+
+        print("scale_a:", W2_s.T.shape)
+        print("scale_b:", post_s.T.shape)
 
         x3 = torch._scaled_mm(
-                post_fp8,
-                W2_fp8.T.contiguous().T,
+                W2_fp8.T.contiguous(),
+                post_fp8.T,
                 out_dtype=torch.bfloat16,
-                scale_a=post_s,
-                scale_b=W2_s)
+                scale_a=W2_s.T,
+                scale_b=post_s.T)
 
         ctx.save_for_backward(x, W1, W2, pre, post_fp8, post_s)
-        return x3.view(x.shape)
+        return x3.T.view(x.shape)
 
+    @torch.compile
     @staticmethod
     def backward(ctx, grad_output):
         x, W1, W2, pre, post_fp8, post_s = ctx.saved_tensors
 
-        grad_output_fp8, grad_output_s = block_quantize(grad_output, 128, 1)
+        grad_output = grad_output.view((-1, grad_output.shape[-1]))
+
+        grad_output_fp8, grad_output_s = block_quantize(grad_output, 128, 1, dtype=torch.float8_e5m2)
 
         dW2 = torch._scaled_mm(
-                post_fp8.T.contiguous(),
-                grad_output_fp8.T.contiguous().T,
+                grad_output_fp8.T.contiguous(),
+                post_fp8.T.contiguous().T,
                 out_dtype=torch.bfloat16,
-                scale_a = post_s.T.contiguous(),
-                scale_b = grad_output_s)
+                scale_a = grad_output_s.T,
+                scale_b = post_s.T.contiguous().T).T
 
 
         dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
@@ -188,16 +196,17 @@ class FusedLinearReLUSquareFunctionFp8(torch.autograd.Function):
 dim = 768
 hdim = dim * 4
 batch_size = 8 * 2048
-x = torch.randn((batch_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+x = torch.randn((1, batch_size, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
 W1 = torch.randn((hdim, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
 W2 = torch.randn((hdim, dim), dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
-x_fp8 = x.clone()
-W1_fp8 = W1.clone()
-W2_fp8 = W2.clone()
+x_fp8 = x.clone().detach().requires_grad_(True)
+W1_fp8 = W1.clone().detach().requires_grad_(True)
+W2_fp8 = W2.clone().detach().requires_grad_(True)
+
 
 post = FusedLinearReLUSquareFunction.apply(x, W1, W2)
-post_fp8 = FusedLinearReLUSquareFunctionFp8.apply(x, W1, W2)
+post_fp8 = FusedLinearReLUSquareFunctionFp8.apply(x_fp8, W1_fp8, W2_fp8)
 
 print("post:", post)
 print("post_fp8:", post_fp8)
@@ -206,3 +215,10 @@ grad = torch.randn_like(post)
 
 post.backward(grad)
 post_fp8.backward(grad)
+
+print("x.grad:", x.grad)
+print("x_fp8.grad:", x_fp8.grad)
+print("W1.grad:", W1.grad)
+print("W1_fp8.grad:", W1_fp8.grad)
+print("W2.grad:", W2.grad)
+print("W2_fp8.grad:", W2_fp8.grad)

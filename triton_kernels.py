@@ -516,18 +516,67 @@ def linear_relu_square(a, b, aux=None):
     else:
         return c
 
+#class FusedLinearReLUSquareFunction(torch.autograd.Function):
+#    @staticmethod
+#    def forward(ctx, x, W1, W2):
+#        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+#        x3 = post @ W2
+#        ctx.save_for_backward(x, W1, W2, pre, post)
+#        return x3.view(x.shape)
+#
+#    @staticmethod
+#    def backward(ctx, grad_output):
+#        x, W1, W2, pre, post = ctx.saved_tensors
+#        dW2 = post.T @ grad_output
+#        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+#        dW1 = dpre.T @ x
+#        dx = dpre @ W1
+#        return dx.view(x.shape), dW1, dW2
+
+def block_quantize(x, BLOCKSIZE_M, BLOCKSIZE_N, dtype=torch.float8_e4m3fn):
+    x_blocked = x.reshape((x.shape[0] // BLOCKSIZE_M, BLOCKSIZE_M, x.shape[1] // BLOCKSIZE_N, BLOCKSIZE_N))
+    
+    
+    eps = 1e-5
+    x_blocked_scales = torch.amax(x_blocked.abs(), dim=(1,3), keepdim=True)
+    x_blocked_fp8 = (x_blocked / (x_blocked_scales + eps)).to(dtype)
+
+    return x_blocked_fp8.reshape(x.shape), x_blocked_scales.squeeze().to(torch.float32)
+
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
         pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
-        x3 = post @ W2
-        ctx.save_for_backward(x, W1, W2, pre, post)
-        return x3.view(x.shape)
+
+        post_fp8, post_s = block_quantize(post, 128, 128)
+        W2_fp8, W2_s = block_quantize(W2, 128, 1)
+
+        x3 = torch._scaled_mm(
+                W2_fp8.T.contiguous(),
+                post_fp8.T,
+                out_dtype=torch.bfloat16,
+                scale_a=W2_s.T,
+                scale_b=post_s.T)
+
+        ctx.save_for_backward(x, W1, W2, pre, post_fp8, post_s)
+        return x3.T.view(x.shape)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, W1, W2, pre, post = ctx.saved_tensors
-        dW2 = post.T @ grad_output
+        x, W1, W2, pre, post_fp8, post_s = ctx.saved_tensors
+
+        grad_output = grad_output.view((-1, grad_output.shape[-1]))
+
+        grad_output_fp8, grad_output_s = block_quantize(grad_output, 128, 1, dtype=torch.float8_e5m2)
+
+        dW2 = torch._scaled_mm(
+                grad_output_fp8.T.contiguous(),
+                post_fp8.T.contiguous().T,
+                out_dtype=torch.bfloat16,
+                scale_a = grad_output_s.T,
+                scale_b = post_s.T.contiguous().T).T
+
+
         dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
