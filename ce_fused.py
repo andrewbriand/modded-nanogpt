@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 import time
 import ctypes
+from torch.utils.cpp_extension import include_paths
 
 @triton.jit
 def fused_softcapped_entropy_fwd_kernel(
@@ -347,11 +348,59 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
         return grad_x, None, None, grad_w, None, None, None
 
+CE_KERNEL_BLOCK_SIZE = 128
 
+CE_KERNEL_DECLS = f"""
+constexpr int VOCAB_SIZE = 50304;
+constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
+"""
+
+CE_KERNEL_SOURCE = """
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+struct __align__(16) __nv_bfloat168 {
+    __nv_bfloat16 data[8];
+    __device__ __nv_bfloat16& operator[](int i) { return data[i]; }
+    __device__ const __nv_bfloat16& operator[](int i) const { return data[i]; }
+};
+
+template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
+
+extern "C"
+__global__ void ce_fwd_bwd_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    const int* __restrict__ targets,
+    const float* __restrict__ mtp_weights,
+    float* __restrict__ losses,
+    __nv_fp8_e5m2* grad_input,
+    int batch_size,
+    int n_predict,
+    double A,
+    double B, 
+    double C,
+    double grad_s,
+    double grad_scale)
+{
+    static_assert(VOCAB_SIZE % BLOCK_SIZE == 0);
+    constexpr int VECS_PER_THREAD = CEIL_DIV((VOCAB_SIZE / BLOCK_SIZE), 2);
+    __nv_bfloat162 thread_logits[VECS_PER_THREAD];
+
+}
+"""
+
+t0 = time.perf_counter()
+ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
+    CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
+    "ce_fwd_bwd_kernel",
+    compute_capability="89",
+    cuda_include_dirs=["/usr/local/cuda/include/"],
+)
+print(f"NVRTC compile time: {(time.perf_counter() - t0)*1e3:.1f} ms")
 
 class FusedSoftcappedCrossEntropyCUDA(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5, grad_scale=1.0):
 
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
@@ -379,41 +428,47 @@ class FusedSoftcappedCrossEntropyCUDA(torch.autograd.Function):
         targets = targets.contiguous()
         mtp_weights = mtp_weights.contiguous()
 
-        grid = (n_rows,)
-        fused_softcapped_entropy_fwd_kernel[grid](
-            logits, losses, lse, targets, mtp_weights,
-            logits.stride(0), logits.stride(1),
-            n_rows, n_cols, n_predict,
-            A, B, C,
-            BLOCK_SIZE=2048,
-            num_warps=2
-        )
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
 
-        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        grid = (n_rows, 1, 1)
+        ce_fwd_bwd_kernel(
+            grid,
+            (CE_KERNEL_BLOCK_SIZE, 1, 1),
+            (logits, targets, mtp_weights, losses, grad_input,
+             n_rows, n_predict, A, B, C, grad_s, grad_scale))
+        #fused_softcapped_entropy_fwd_kernel[grid](
+        #    logits, losses, lse, targets, mtp_weights,
+        #    logits.stride(0), logits.stride(1),
+        #    n_rows, n_cols, n_predict,
+        #    A, B, C,
+        #    BLOCK_SIZE=2048,
+        #    num_warps=2
+        #)
+
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input)
         ctx.params = (A, B, C, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input = ctx.saved_tensors
         A, B, C, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
 
-        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
         grad_output = grad_output.contiguous()
 
-        grid = (n_rows,)
-        fused_softcapped_entropy_bwd_kernel[grid](
-            grad_input, grad_output, lse, logits, targets, mtp_weights,
-            logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
-            n_rows, n_cols, n_predict,
-            A, B, C,
-            grad_s,
-            BLOCK_SIZE=1024,
-            num_warps=4,
-            N_PREDICT=n_predict,
-        )
+        #grid = (n_rows,)
+        #fused_softcapped_entropy_bwd_kernel[grid](
+        #    grad_input, grad_output, lse, logits, targets, mtp_weights,
+        #    logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
+        #    n_rows, n_cols, n_predict,
+        #    A, B, C,
+        #    grad_s,
+        #    BLOCK_SIZE=1024,
+        #    num_warps=4,
+        #    N_PREDICT=n_predict,
+        #)
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
         w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
@@ -474,7 +529,7 @@ print("losses_ref:", losses_ref)
 print("losses_kernel:", losses_kernel)
 torch.testing.assert_close(losses_ref, losses_kernel)
 
-grad = torch.randn_like(losses_ref)
+grad = torch.ones_like(losses_ref)
 
 losses_ref.backward(grad)
 losses_kernel.backward(grad)
@@ -525,90 +580,4 @@ end = time.time()
 
 print("CUDA (ms):", ((end - start) * 1e3) / iters)
 
-exit()
 
-HEADER_CODE = """
-// Parameterize dtype via a type alias injected from Python at compile time.
-// Switch this to "__half" for fp16, "__nv_bfloat16" for bf16, etc.
-using scalar_t = float;
-"""
- 
-KERNEL_SOURCE = """
-extern "C"
-__global__ void scaled_add_kernel(
-    const scalar_t* __restrict__ a,
-    const scalar_t* __restrict__ b,
-          scalar_t* __restrict__ out,
-    double alpha,
-    double beta,
-    int   n)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n)
-        out[idx] = alpha * a[idx] + beta * b[idx];
-}
-"""
- 
-# ---------------------------------------------------------------------------
-# 2.  Compile  — ~10 ms cold, instant warm (PTX is cached in memory)
-# ---------------------------------------------------------------------------
-t0 = time.perf_counter()
-kernel = torch.cuda._compile_kernel(
-    HEADER_CODE + KERNEL_SOURCE,
-    "scaled_add_kernel",
-    compute_capability="89"
-)
-print(f"NVRTC compile time: {(time.perf_counter() - t0)*1e3:.1f} ms")
- 
-# ---------------------------------------------------------------------------
-# 3.  Python-side launcher
-#
-#     _compile_kernel returns a callable with the signature:
-#         kernel((grid_x, grid_y, grid_z), (block_x, block_y, block_z), args_tuple)
-#
-#     • Tensors in args_tuple → automatically extracted as device pointers
-#     • int / float scalars   → passed by value via ctypes
-#     • All tensors must be contiguous and on the same CUDA device
-# ---------------------------------------------------------------------------
-THREADS = 256
- 
-def scaled_add(a: torch.Tensor, b: torch.Tensor,
-               alpha: float = 1.0, beta: float = 1.0) -> torch.Tensor:
-    assert a.is_cuda and b.is_cuda, "inputs must be CUDA tensors"
-    assert a.shape == b.shape,      "inputs must have the same shape"
-    assert a.is_contiguous() and b.is_contiguous()
- 
-    out = torch.zeros_like(a)
-    n   = a.numel()
-    grid = ((n + THREADS - 1) // THREADS, 1, 1)
-
-    print(grid)
- 
-    kernel(
-        grid,                       # (grid_x, grid_y, grid_z)
-        (THREADS, 1, 1),            # (block_x, block_y, block_z)
-        (a, b, out,                 # Tensors → raw device pointers
-         alpha, beta, # scalars passed by value
-         n),
-    )
-    return out
- 
-# ---------------------------------------------------------------------------
-# 4.  Correctness check
-# ---------------------------------------------------------------------------
-N     = 1 << 22          # 4 M elements
-alpha = 2.0
-beta  = 0.5
- 
-a = torch.randn(N, device="cuda", dtype=torch.float32)
-b = torch.randn(N, device="cuda", dtype=torch.float32)
- 
-expected = alpha * a + beta * b
-got      = scaled_add(a, b, alpha, beta)
-
-print("expected:", expected)
-print("got:", got)
- 
-torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
-print("✓ Correctness check passed.")
- 
