@@ -1,0 +1,567 @@
+import torch
+import triton
+import triton.language as tl
+import time
+import ctypes
+
+@triton.jit
+def fused_softcapped_entropy_fwd_kernel(
+    logits_ptr, losses_ptr, lse_ptr, targets_ptr, mtp_weights_ptr,
+    stride_logits_n, stride_logits_v,
+    n_rows, n_cols, n_predict,
+    A, B, C,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+
+    max_val = -float('inf')
+    sum_exp = 0.0
+
+    inv_C = 1.0 / C
+    B_div_C = B * inv_C
+
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
+        z = A * tl.sigmoid(val * inv_C + B_div_C)
+        z = tl.where(mask, z, -float('inf'))
+        curr_max = tl.max(z, axis=0)
+        new_max = tl.maximum(max_val, curr_max)
+        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
+        max_val = new_max
+
+    lse = max_val + tl.log(sum_exp)
+    tl.store(lse_ptr + row_idx, lse)
+
+    total_loss = 0.0
+    for k in range(n_predict):
+        target_idx = row_idx + k
+        if target_idx < n_rows:
+            weight = tl.load(mtp_weights_ptr + k)
+            if weight > 0:
+                target = tl.load(targets_ptr + target_idx).to(tl.int32)
+                if target >= 0 and target < n_cols:
+                    val_target = tl.load(logits_row_ptr + target).to(tl.float32)
+                    z_target = A * tl.sigmoid(val_target * inv_C + B_div_C)
+                    total_loss += weight * (lse - z_target)
+
+    tl.store(losses_ptr + row_idx, total_loss)
+
+@triton.jit
+def fused_softcapped_entropy_bwd_kernel(
+    grad_input_ptr, grad_output_ptr, lse_ptr, logits_ptr, targets_ptr, mtp_weights_ptr,
+    stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
+    n_rows, n_cols, n_predict,
+    A, B, C,
+    grad_s,
+    BLOCK_SIZE: tl.constexpr,
+    N_PREDICT: tl.constexpr
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+    grad_row_ptr = grad_input_ptr + row_idx * stride_grad_n
+
+    lse = tl.load(lse_ptr + row_idx)
+    grad_loss = tl.load(grad_output_ptr + row_idx)
+
+    inv_C = 1.0 / C
+    B_div_C = B * inv_C
+    inv_C_A = inv_C * A
+    inv_grad_s = 1.0 / grad_s
+
+    # Preload all targets and weights before the column loop
+    S_w = 0.0
+    t0: tl.int32 = -1
+    t1: tl.int32 = -1
+    t2: tl.int32 = -1
+    w0: tl.float32 = 0.0
+    w1: tl.float32 = 0.0
+    w2: tl.float32 = 0.0
+
+    if N_PREDICT >= 1:
+        if row_idx + 0 < n_rows:
+            w0 = tl.load(mtp_weights_ptr + 0)
+            t0 = tl.load(targets_ptr + row_idx + 0).to(tl.int32)
+            S_w += w0
+
+    if N_PREDICT >= 2:
+        if row_idx + 1 < n_rows:
+            w1 = tl.load(mtp_weights_ptr + 1)
+            t1 = tl.load(targets_ptr + row_idx + 1).to(tl.int32)
+            S_w += w1
+
+    if N_PREDICT >= 3:
+        if row_idx + 2 < n_rows:
+            w2 = tl.load(mtp_weights_ptr + 2)
+            t2 = tl.load(targets_ptr + row_idx + 2).to(tl.int32)
+            S_w += w2
+
+    # Fuse all scalar multiplications
+    grad_scale = grad_loss * inv_grad_s
+    grad_scale_icA = grad_scale * inv_C_A
+
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        u = val * inv_C + B_div_C
+        sigmoid_u = tl.sigmoid(u)
+        z = A * sigmoid_u
+        p = tl.exp(z - lse)
+
+        term1 = S_w * p
+
+        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        if N_PREDICT >= 1:
+            term2 += tl.where(cols == t0, w0, 0.0)
+        if N_PREDICT >= 2:
+            term2 += tl.where(cols == t1, w1, 0.0)
+        if N_PREDICT >= 3:
+            term2 += tl.where(cols == t2, w2, 0.0)
+
+        grad_z = term1 - term2
+        grad_x = grad_scale_icA * grad_z * sigmoid_u * (1.0 - sigmoid_u)
+        grad_x = grad_x.to(tl.float8e5)
+        tl.store(grad_row_ptr + cols, grad_x, mask=mask)
+
+# -----------------------------------------------------------------------------
+# Tiled transpose copy kernel: dst (N, M) = src (M, N).T
+# Uses coalesced reads from src and coalesced writes to dst via tl.trans().
+# Replaces PyTorch's elementwise copy_ which uses a naive 75k-block kernel
+# with non-coalesced writes, saturating all SMs and blocking NCCL.
+
+@triton.jit
+def _transpose_copy_kernel(
+    src_ptr, dst_ptr,
+    M, N,
+    src_stride_m, src_stride_n,
+    dst_stride_0, dst_stride_1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Coalesced read from src (M, N)
+    tile = tl.load(
+        src_ptr + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
+        mask=mask, other=0.0,
+    )
+
+    # Coalesced write to dst (N, M): dst[n, m] = src[m, n]
+    mask_T = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    tl.store(
+        dst_ptr + offs_n[:, None] * dst_stride_0 + offs_m[None, :] * dst_stride_1,
+        tl.trans(tile), mask=mask_T,
+    )
+
+
+def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
+    """Tiled transpose copy: dst = src.T where src is (M, N) and dst is (N, M).
+
+    Uses a 64x128 tiled Triton kernel with coalesced reads AND writes,
+    achieving near memory-bandwidth-limited performance.
+    """
+    assert src.ndim == 2 and dst.ndim == 2
+    M, N = src.shape
+    assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
+
+    BLOCK_M, BLOCK_N = 64, 128
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    _transpose_copy_kernel[grid](
+        src, dst,
+        M, N,
+        src.stride(0), src.stride(1),
+        dst.stride(0), dst.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=8,
+        num_stages=2,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Tiled transpose-add kernel: dst (M, N) += src (N, M).T
+# Same tiling strategy as transpose_copy but with a fused read-add-write.
+# Replaces PyTorch's .add_(src.T) which uses the same 75k-block elementwise
+# kernel with non-coalesced reads from the transposed operand.
+
+@triton.jit
+def _transpose_add_kernel(
+    src_ptr, dst_ptr,
+    M, N,
+    src_stride_m, src_stride_n,
+    dst_stride_0, dst_stride_1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Coalesced read from src (M, N)
+    src_tile = tl.load(
+        src_ptr + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
+        mask=mask, other=0.0,
+    )
+
+    # Coalesced read-add-write on dst (N, M): dst[n, m] += src[m, n]
+    mask_T = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    dst_ptrs = dst_ptr + offs_n[:, None] * dst_stride_0 + offs_m[None, :] * dst_stride_1
+    dst_tile = tl.load(dst_ptrs, mask=mask_T, other=0.0)
+    tl.store(dst_ptrs, dst_tile + tl.trans(src_tile), mask=mask_T)
+
+
+def transpose_add(src: torch.Tensor, dst: torch.Tensor):
+    """Tiled transpose-add: dst += src.T where src is (M, N) and dst is (N, M).
+
+    Uses a 32x32 tiled Triton kernel with coalesced access on both src and dst,
+    replacing PyTorch's .add_(src.T) which has non-coalesced reads from the
+    transposed operand.
+    """
+    assert src.ndim == 2 and dst.ndim == 2
+    M, N = src.shape
+    assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
+
+    BLOCK_M, BLOCK_N = 32, 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    _transpose_add_kernel[grid](
+        src, dst,
+        M, N,
+        src.stride(0), src.stride(1),
+        dst.stride(0), dst.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+class FusedSoftcappedCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
+
+        w_f8_col_major = w_f8.T.contiguous().T
+
+        logits = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+
+        n_rows, n_cols = logits.shape
+        if mtp_weights is None:
+             mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
+        n_predict = mtp_weights.shape[0]
+
+        losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+
+        logits = logits.contiguous()
+        targets = targets.contiguous()
+        mtp_weights = mtp_weights.contiguous()
+
+        grid = (n_rows,)
+        fused_softcapped_entropy_fwd_kernel[grid](
+            logits, losses, lse, targets, mtp_weights,
+            logits.stride(0), logits.stride(1),
+            n_rows, n_cols, n_predict,
+            A, B, C,
+            BLOCK_SIZE=2048,
+            num_warps=2
+        )
+
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        ctx.params = (A, B, C, x_s, w_s, grad_s)
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        A, B, C, x_s, w_s, grad_s = ctx.params
+        n_rows, n_cols = logits.shape
+        n_predict = mtp_weights.shape[0]
+
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
+        grad_output = grad_output.contiguous()
+
+        grid = (n_rows,)
+        fused_softcapped_entropy_bwd_kernel[grid](
+            grad_input, grad_output, lse, logits, targets, mtp_weights,
+            logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
+            n_rows, n_cols, n_predict,
+            A, B, C,
+            grad_s,
+            BLOCK_SIZE=1024,
+            num_warps=4,
+            N_PREDICT=n_predict,
+        )
+
+        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+
+        grad_x = torch._scaled_mm(
+            grad_input,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+
+        x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
+        transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
+
+        grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
+        transpose_copy(grad_input, grad_input_T)  # (50304, n_rows) row-major
+
+        grad_w = torch._scaled_mm(
+            x_f8_T,            # (768, n_rows) row-major
+            grad_input_T.T,    # (n_rows, 50304) column-major view
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+
+        return grad_x, None, None, grad_w, None, None, None
+
+class FusedSoftcappedCrossEntropyCUDA(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
+
+        w_f8_col_major = w_f8.T.contiguous().T
+
+        logits = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+
+        n_rows, n_cols = logits.shape
+        if mtp_weights is None:
+             mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
+        n_predict = mtp_weights.shape[0]
+
+        losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+
+        logits = logits.contiguous()
+        targets = targets.contiguous()
+        mtp_weights = mtp_weights.contiguous()
+
+        grid = (n_rows,)
+        fused_softcapped_entropy_fwd_kernel[grid](
+            logits, losses, lse, targets, mtp_weights,
+            logits.stride(0), logits.stride(1),
+            n_rows, n_cols, n_predict,
+            A, B, C,
+            BLOCK_SIZE=2048,
+            num_warps=2
+        )
+
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        ctx.params = (A, B, C, x_s, w_s, grad_s)
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        A, B, C, x_s, w_s, grad_s = ctx.params
+        n_rows, n_cols = logits.shape
+        n_predict = mtp_weights.shape[0]
+
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
+        grad_output = grad_output.contiguous()
+
+        grid = (n_rows,)
+        fused_softcapped_entropy_bwd_kernel[grid](
+            grad_input, grad_output, lse, logits, targets, mtp_weights,
+            logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
+            n_rows, n_cols, n_predict,
+            A, B, C,
+            grad_s,
+            BLOCK_SIZE=1024,
+            num_warps=4,
+            N_PREDICT=n_predict,
+        )
+
+        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+
+        grad_x = torch._scaled_mm(
+            grad_input,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+
+        x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
+        transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
+
+        grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
+        transpose_copy(grad_input, grad_input_T)  # (50304, n_rows) row-major
+
+        grad_w = torch._scaled_mm(
+            x_f8_T,            # (768, n_rows) row-major
+            grad_input_T.T,    # (n_rows, 50304) column-major view
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+
+        return grad_x, None, None, grad_w, None, None, None
+
+batch_size = 8 * 2048
+vocab_size = 50304
+model_dim = 768
+
+dtype = torch.bfloat16
+
+x = torch.randn((batch_size, model_dim), dtype=dtype, device="cuda")
+targets = torch.randint(low=0, high=vocab_size+1, size=(batch_size,), dtype=torch.int32, device="cuda")
+mtp_weights = torch.randn((3,), dtype=torch.float32, device="cuda").abs()
+lm_head_weight = torch.randn((model_dim, vocab_size), dtype=dtype, device="cuda") / 10
+x_s = 100/488
+w_s = 1.6/448
+grad_s = 0.75/448
+
+x_ref = x.clone().detach().requires_grad_(True)
+lm_head_weight_ref = lm_head_weight.clone().detach().requires_grad_(True)
+
+x_kernel = x.clone().detach().requires_grad_(True)
+lm_head_weight_kernel = lm_head_weight.clone().detach().requires_grad_(True)
+
+# Correctness check
+
+losses_ref = FusedSoftcappedCrossEntropy.apply(x_ref, targets, mtp_weights, lm_head_weight_ref, x_s, w_s, grad_s)
+losses_kernel = FusedSoftcappedCrossEntropyCUDA.apply(x_kernel, targets, mtp_weights, lm_head_weight_kernel, x_s, w_s, grad_s)
+
+print("losses_ref:", losses_ref)
+print("losses_kernel:", losses_kernel)
+torch.testing.assert_close(losses_ref, losses_kernel)
+
+grad = torch.randn_like(losses_ref)
+
+losses_ref.backward(grad)
+losses_kernel.backward(grad)
+
+torch.testing.assert_close(x_ref.grad, x_kernel.grad)
+torch.testing.assert_close(lm_head_weight_ref.grad, lm_head_weight_kernel.grad)
+
+HEADER_CODE = """
+// Parameterize dtype via a type alias injected from Python at compile time.
+// Switch this to "__half" for fp16, "__nv_bfloat16" for bf16, etc.
+using scalar_t = float;
+"""
+ 
+KERNEL_SOURCE = """
+extern "C"
+__global__ void scaled_add_kernel(
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
+          scalar_t* __restrict__ out,
+    double alpha,
+    double beta,
+    int   n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        out[idx] = alpha * a[idx] + beta * b[idx];
+}
+"""
+ 
+# ---------------------------------------------------------------------------
+# 2.  Compile  — ~10 ms cold, instant warm (PTX is cached in memory)
+# ---------------------------------------------------------------------------
+t0 = time.perf_counter()
+kernel = torch.cuda._compile_kernel(
+    HEADER_CODE + KERNEL_SOURCE,
+    "scaled_add_kernel",
+    compute_capability="89"
+)
+print(f"NVRTC compile time: {(time.perf_counter() - t0)*1e3:.1f} ms")
+ 
+# ---------------------------------------------------------------------------
+# 3.  Python-side launcher
+#
+#     _compile_kernel returns a callable with the signature:
+#         kernel((grid_x, grid_y, grid_z), (block_x, block_y, block_z), args_tuple)
+#
+#     • Tensors in args_tuple → automatically extracted as device pointers
+#     • int / float scalars   → passed by value via ctypes
+#     • All tensors must be contiguous and on the same CUDA device
+# ---------------------------------------------------------------------------
+THREADS = 256
+ 
+def scaled_add(a: torch.Tensor, b: torch.Tensor,
+               alpha: float = 1.0, beta: float = 1.0) -> torch.Tensor:
+    assert a.is_cuda and b.is_cuda, "inputs must be CUDA tensors"
+    assert a.shape == b.shape,      "inputs must have the same shape"
+    assert a.is_contiguous() and b.is_contiguous()
+ 
+    out = torch.zeros_like(a)
+    n   = a.numel()
+    grid = ((n + THREADS - 1) // THREADS, 1, 1)
+
+    print(grid)
+ 
+    kernel(
+        grid,                       # (grid_x, grid_y, grid_z)
+        (THREADS, 1, 1),            # (block_x, block_y, block_z)
+        (a, b, out,                 # Tensors → raw device pointers
+         alpha, beta, # scalars passed by value
+         n),
+    )
+    return out
+ 
+# ---------------------------------------------------------------------------
+# 4.  Correctness check
+# ---------------------------------------------------------------------------
+N     = 1 << 22          # 4 M elements
+alpha = 2.0
+beta  = 0.5
+ 
+a = torch.randn(N, device="cuda", dtype=torch.float32)
+b = torch.randn(N, device="cuda", dtype=torch.float32)
+ 
+expected = alpha * a + beta * b
+got      = scaled_add(a, b, alpha, beta)
+
+print("expected:", expected)
+print("got:", got)
+ 
+torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+print("✓ Correctness check passed.")
+ 
