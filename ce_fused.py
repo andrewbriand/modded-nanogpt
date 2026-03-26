@@ -347,6 +347,8 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
         return grad_x, None, None, grad_w, None, None, None
 
+
+
 class FusedSoftcappedCrossEntropyCUDA(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
@@ -479,6 +481,51 @@ losses_kernel.backward(grad)
 
 torch.testing.assert_close(x_ref.grad, x_kernel.grad)
 torch.testing.assert_close(lm_head_weight_ref.grad, lm_head_weight_kernel.grad)
+
+warmups = 5
+iters = 100
+
+x_ref.grad = None
+lm_head_weight_ref.grad = None
+for i in range(warmups):
+    losses_ref = FusedSoftcappedCrossEntropy.apply(x_ref, targets, mtp_weights, lm_head_weight_ref, x_s, w_s, grad_s)
+    losses_ref.backward(grad)
+    x_ref.grad = None
+    lm_head_weight_ref.grad = None
+torch.cuda.synchronize()
+
+start = time.time()
+for i in range(iters):
+    losses_ref = FusedSoftcappedCrossEntropy.apply(x_ref, targets, mtp_weights, lm_head_weight_ref, x_s, w_s, grad_s)
+    losses_ref.backward(grad)
+    x_ref.grad = None
+    lm_head_weight_ref.grad = None
+torch.cuda.synchronize()
+end = time.time()
+
+print("Baseline (ms):", ((end - start) * 1e3) / iters)
+
+x_kernel.grad = None
+lm_head_weight_kernel.grad = None
+for i in range(warmups):
+    losses_kernel = FusedSoftcappedCrossEntropyCUDA.apply(x_kernel, targets, mtp_weights, lm_head_weight_kernel, x_s, w_s, grad_s)
+    losses_kernel.backward(grad)
+    x_kernel.grad = None
+    lm_head_weight_kernel.grad = None
+torch.cuda.synchronize()
+
+start = time.time()
+for i in range(iters):
+    losses_kernel = FusedSoftcappedCrossEntropyCUDA.apply(x_kernel, targets, mtp_weights, lm_head_weight_kernel, x_s, w_s, grad_s)
+    losses_kernel.backward(grad)
+    x_kernel.grad = None
+    lm_head_weight_kernel.grad = None
+torch.cuda.synchronize()
+end = time.time()
+
+print("CUDA (ms):", ((end - start) * 1e3) / iters)
+
+exit()
 
 HEADER_CODE = """
 // Parameterize dtype via a type alias injected from Python at compile time.
