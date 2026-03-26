@@ -437,10 +437,7 @@ __global__ void ce_fwd_bwd_kernel(
   constexpr int NUM_WARPS = BLOCK_SIZE / 32;
   int warp_id = threadIdx.x / 32;
   __shared__ float block_maxs[NUM_WARPS];
-  __shared__ float block_sum;
-  if (threadIdx.x == 0) {
-    block_sum = 0.0f;
-  }
+  __shared__ float block_sums[NUM_WARPS];
 
   for (int offset = 16; offset > 0; offset >>= 1)
     thread_max = fmaxf(thread_max, __shfl_down_sync(0xFFFFFFFF, thread_max, offset));
@@ -471,9 +468,19 @@ __global__ void ce_fwd_bwd_kernel(
     }
   }
 
-  atomicAdd(&block_sum, thread_sum);
+  for (int offset = 16; offset > 0; offset >>= 1)
+    thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
+
+  if (threadIdx.x % 32 == 0) {
+    block_sums[warp_id] = thread_sum;
+  }
 
   __syncthreads();
+
+  float block_sum = 0.0f;
+  for (int i = 0; i < NUM_WARPS; i++) {
+    block_sum += block_sums[i];
+  }
 
   float lse = block_max + __logf(block_sum);
 
