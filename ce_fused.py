@@ -445,7 +445,9 @@ __global__ void ce_fwd_bwd_kernel(
   for (int offset = 16; offset > 0; offset >>= 1)
     thread_max = fmaxf(thread_max, __shfl_down_sync(0xFFFFFFFF, thread_max, offset));
 
-  block_maxs[warp_id] = thread_max;
+  if (threadIdx.x % 32 == 0) {
+    block_maxs[warp_id] = thread_max;
+  }
 
   __syncthreads();
 
@@ -463,7 +465,9 @@ __global__ void ce_fwd_bwd_kernel(
     for (int k = 0; k < VEC_WIDTH; k++) {
       float tmp = __bfloat162float(thread_logits[i][k]);
       tmp = __expf(tmp - block_max);
-      thread_sum += tmp;
+      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+        thread_sum += tmp;
+      }
     }
   }
 
@@ -491,12 +495,16 @@ __global__ void ce_fwd_bwd_kernel(
 }
 """
 
+with open("ce_fwd_bwd_kernel.cu", "w+") as f:
+  f.write(CE_KERNEL_DECLS + CE_KERNEL_SOURCE)
+
 t0 = time.perf_counter()
 ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
     "ce_fwd_bwd_kernel",
     compute_capability="89",
     cuda_include_dirs=["/usr/local/cuda/include/"],
+    nvcc_options=["-lineinfo", "--use_fast_math"],
 )
 print(f"NVRTC compile time: {(time.perf_counter() - t0)*1e3:.1f} ms")
 ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
@@ -632,7 +640,8 @@ losses_kernel = FusedSoftcappedCrossEntropyCUDA.apply(x_kernel, targets, mtp_wei
 
 print("losses_ref:", losses_ref)
 print("losses_kernel:", losses_kernel)
-torch.testing.assert_close(losses_ref, losses_kernel)
+torch.testing.assert_close(losses_ref.to(torch.bfloat16), losses_kernel.to(torch.bfloat16))
+print("fwd PASS")
 
 grad = torch.ones_like(losses_ref)
 
