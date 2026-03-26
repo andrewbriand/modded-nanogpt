@@ -349,15 +349,17 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         return grad_x, None, None, grad_w, None, None, None
 
 CE_KERNEL_BLOCK_SIZE = 128
+CE_KERNEL_VOCAB_SIZE = 50304;
 
 CE_KERNEL_DECLS = f"""
-constexpr int VOCAB_SIZE = 50304;
+constexpr int VOCAB_SIZE = {CE_KERNEL_VOCAB_SIZE};
 constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
 """
 
 CE_KERNEL_SOURCE = """
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <math_constants.h>
 
 struct __align__(16) __nv_bfloat168 {
     __nv_bfloat16 data[8];
@@ -367,7 +369,12 @@ struct __align__(16) __nv_bfloat168 {
 
 template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
 
+__device__ float sigmoid(float x) {
+  return 1.0f / (1.0f + __expf(-x));
+}
+
 extern "C"
+__launch_bounds__(128, 2)
 __global__ void ce_fwd_bwd_kernel(
     const __nv_bfloat16* __restrict__ logits,
     const int* __restrict__ targets,
@@ -376,16 +383,111 @@ __global__ void ce_fwd_bwd_kernel(
     __nv_fp8_e5m2* grad_input,
     int batch_size,
     int n_predict,
-    double A,
-    double B, 
-    double C,
+    double A_param,
+    double B_param, 
+    double C_param,
     double grad_s,
     double grad_scale)
 {
-    static_assert(VOCAB_SIZE % BLOCK_SIZE == 0);
-    constexpr int VECS_PER_THREAD = CEIL_DIV((VOCAB_SIZE / BLOCK_SIZE), 2);
-    __nv_bfloat162 thread_logits[VECS_PER_THREAD];
+  constexpr int VEC_WIDTH = 8;
+  constexpr int NUM_FULL_LOADS = VOCAB_SIZE / (BLOCK_SIZE * VEC_WIDTH);
+  constexpr int NUM_LOADS = CEIL_DIV(VOCAB_SIZE, BLOCK_SIZE * VEC_WIDTH);
 
+  float A = (float)A_param;
+  float B = (float)B_param;
+  float C = (float)C_param;
+
+  extern __shared__ __nv_bfloat16 smem[];
+
+  static_assert(VEC_WIDTH == 8);
+  __nv_bfloat168 thread_logits[NUM_LOADS];
+
+  const __nv_bfloat16 *block_logit_ptr = logits + VOCAB_SIZE * blockIdx.x;
+
+  #pragma unroll
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      thread_logits[i] = *(__nv_bfloat168*)(&block_logit_ptr[idx]);
+    }
+  }
+
+  float inv_C = 1 / C;
+  float B_div_C = B * inv_C;
+  float thread_max = -CUDART_INF_F;
+  #pragma unroll
+  for (int i = 0; i < NUM_LOADS; i++) {
+    __nv_bfloat168 result;
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    #pragma unroll 
+    for (int k = 0; k < VEC_WIDTH; k++) {
+      float tmp = __bfloat162float(thread_logits[i][k]);
+      tmp = A * sigmoid(tmp * inv_C + B_div_C);
+      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+        thread_max = max(tmp, thread_max);
+      }
+      result[k] = __float2bfloat16(tmp);
+    }
+    thread_logits[i] = result;
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      *(__nv_bfloat168*)(&smem[idx]) = result;
+    }
+  }
+
+  constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+  int warp_id = threadIdx.x / 32;
+  __shared__ float block_maxs[NUM_WARPS];
+  __shared__ float block_sum;
+  if (threadIdx.x == 0) {
+    block_sum = 0.0f;
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1)
+    thread_max = fmaxf(thread_max, __shfl_down_sync(0xFFFFFFFF, thread_max, offset));
+
+  block_maxs[warp_id] = thread_max;
+
+  __syncthreads();
+
+  float block_max = -CUDART_INF_F;
+  for (int i = 0; i < NUM_WARPS; i++) {
+    block_max = fmaxf(block_max, block_maxs[i]);
+  }
+
+  float thread_sum = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < NUM_LOADS; i++) {
+    __nv_bfloat168 result;
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    #pragma unroll 
+    for (int k = 0; k < VEC_WIDTH; k++) {
+      float tmp = __bfloat162float(thread_logits[i][k]);
+      tmp = __expf(tmp - block_max);
+      thread_sum += tmp;
+    }
+  }
+
+  atomicAdd(&block_sum, thread_sum);
+
+  __syncthreads();
+
+  float lse = block_max + __logf(block_sum);
+
+  if (threadIdx.x == 0) {
+    float total_loss = 0.0f;
+    for (int k = 0; k < n_predict; k++) {
+      int target_idx = blockIdx.x + k;
+      if (target_idx < batch_size) {
+        float weight = mtp_weights[k];
+        int target = targets[target_idx];
+        if (target >= 0 && target < VOCAB_SIZE) {
+          float z_target = __bfloat162float(smem[target]);
+          total_loss += weight * (lse - z_target);  
+        }
+      }
+    }
+    losses[blockIdx.x] = total_loss;
+  }
 }
 """
 
@@ -397,6 +499,7 @@ ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     cuda_include_dirs=["/usr/local/cuda/include/"],
 )
 print(f"NVRTC compile time: {(time.perf_counter() - t0)*1e3:.1f} ms")
+ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
 
 class FusedSoftcappedCrossEntropyCUDA(torch.autograd.Function):
     @staticmethod
@@ -435,7 +538,9 @@ class FusedSoftcappedCrossEntropyCUDA(torch.autograd.Function):
             grid,
             (CE_KERNEL_BLOCK_SIZE, 1, 1),
             (logits, targets, mtp_weights, losses, grad_input,
-             n_rows, n_predict, A, B, C, grad_s, grad_scale))
+             n_rows, n_predict, A, B, C, grad_s, grad_scale),
+            shared_mem=CE_KERNEL_VOCAB_SIZE*2
+        )
         #fused_softcapped_entropy_fwd_kernel[grid](
         #    logits, losses, lse, targets, mtp_weights,
         #    logits.stride(0), logits.stride(1),
