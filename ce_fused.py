@@ -349,7 +349,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         return grad_x, None, None, grad_w, None, None, None
 
 CE_KERNEL_BLOCK_SIZE = 128
-CE_KERNEL_VOCAB_SIZE = 50304;
+CE_KERNEL_VOCAB_SIZE = 50304
 
 CE_KERNEL_DECLS = f"""
 constexpr int VOCAB_SIZE = {CE_KERNEL_VOCAB_SIZE};
@@ -380,7 +380,7 @@ __device__ float sigmoid(float x) {
 }
 
 extern "C"
-__launch_bounds__(128, 2)
+__launch_bounds__(BLOCK_SIZE, 256 / BLOCK_SIZE)
 __global__ void ce_fwd_bwd_kernel(
     const __nv_bfloat16* __restrict__ logits,
     const int* __restrict__ targets,
@@ -570,7 +570,7 @@ t0 = time.perf_counter()
 ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
     "ce_fwd_bwd_kernel",
-    compute_capability="89",
+    compute_capability="90",
     cuda_include_dirs=["/usr/local/cuda/include/"],
     nvcc_options=["-lineinfo", "--use_fast_math"],
 )
