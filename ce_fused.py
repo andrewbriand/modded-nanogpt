@@ -348,7 +348,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
         return grad_x, None, None, grad_w, None, None, None
 
-CE_KERNEL_BLOCK_SIZE = 128
+CE_KERNEL_BLOCK_SIZE = 256
 CE_KERNEL_VOCAB_SIZE = 50304
 
 CE_KERNEL_DECLS = f"""
@@ -375,12 +375,15 @@ struct __align__(8) __nv_fp8_e5m28 {
 
 template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
 
+//__device__ float sigmoid(float x) {
+//  return 1.0f / (1.0f + __expf(-x));
+//}
 __device__ float sigmoid(float x) {
-  return 1.0f / (1.0f + __expf(-x));
+  return (1.0f + __tanhf(x * 0.5f)) / 2;
 }
 
 extern "C"
-__launch_bounds__(BLOCK_SIZE, 256 / BLOCK_SIZE)
+__launch_bounds__(BLOCK_SIZE, 2)
 __global__ void ce_fwd_bwd_kernel(
     const __nv_bfloat16* __restrict__ logits,
     const int* __restrict__ targets,
@@ -453,6 +456,7 @@ __global__ void ce_fwd_bwd_kernel(
   }
 
   float thread_sum = 0.0f;
+  #pragma unroll 2
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     __nv_bfloat168 l;
@@ -518,6 +522,7 @@ __global__ void ce_fwd_bwd_kernel(
     }
   }
 
+  #pragma unroll 4
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     __nv_fp8_e5m28 result;
@@ -591,7 +596,7 @@ t0 = time.perf_counter()
 ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
     "ce_fwd_bwd_kernel",
-    compute_capability="89",
+    compute_capability="90",
     cuda_include_dirs=["/usr/local/cuda/include/"],
     nvcc_options=["-lineinfo", "--use_fast_math"],
 )
