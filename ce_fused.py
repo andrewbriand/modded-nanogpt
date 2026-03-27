@@ -408,39 +408,27 @@ __global__ void ce_fwd_bwd_kernel(
   extern __shared__ __nv_bfloat16 smem[];
 
   static_assert(VEC_WIDTH == 8);
-  __nv_bfloat168 thread_logits[NUM_LOADS];
 
   const __nv_bfloat16 *block_logit_ptr = logits + VOCAB_SIZE * blockIdx.x;
-
-  #pragma unroll
-  for (int i = 0; i < NUM_LOADS; i++) {
-    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
-    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
-      thread_logits[i] = *(__nv_bfloat168*)(&block_logit_ptr[idx]);
-    }
-  }
 
   float inv_C = 1 / C;
   float B_div_C = B * inv_C;
   float thread_max = -CUDART_INF_F;
+
   #pragma unroll
   for (int i = 0; i < NUM_LOADS; i++) {
-    __nv_bfloat168 result;
-    __nv_bfloat168 result_sigmoid;
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
-    #pragma unroll 
-    for (int k = 0; k < VEC_WIDTH; k++) {
-      float tmp = __bfloat162float(thread_logits[i][k]);
-      tmp = sigmoid(tmp * inv_C + B_div_C);
-      result_sigmoid[k] = __float2bfloat16(tmp);
-      tmp = A * tmp;
-      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      __nv_bfloat168 result = *(__nv_bfloat168*)(&block_logit_ptr[idx]);
+      __nv_bfloat168 result_sigmoid;
+      #pragma unroll 
+      for (int k = 0; k < VEC_WIDTH; k++) {
+        float tmp = __bfloat162float(result[k]);
+        tmp = sigmoid(tmp * inv_C + B_div_C);
+        result_sigmoid[k] = __float2bfloat16(tmp);
+        tmp = A * tmp;
         thread_max = max(tmp, thread_max);
       }
-      result[k] = __float2bfloat16(tmp);
-    }
-    thread_logits[i] = result;
-    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
       *(__nv_bfloat168*)(&smem[idx]) = result_sigmoid;
     }
   }
@@ -468,9 +456,13 @@ __global__ void ce_fwd_bwd_kernel(
   #pragma unroll
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    __nv_bfloat168 l;
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      l = *(__nv_bfloat168*)(&smem[idx]);
+    }
     #pragma unroll 
     for (int k = 0; k < VEC_WIDTH; k++) {
-      float tmp = __bfloat162float(thread_logits[i][k]);
+      float tmp = A * __bfloat162float(l[k]);
       tmp = __expf(tmp - block_max);
       if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
         thread_sum += tmp;
@@ -527,6 +519,7 @@ __global__ void ce_fwd_bwd_kernel(
     }
   }
 
+  #pragma unroll
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
