@@ -520,10 +520,20 @@ __global__ void ce_fwd_bwd_kernel(
 
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
-    __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
     __nv_fp8_e5m28 result;
+
+    bool can_contain_target = false;
+    #pragma unroll
+    for (int k = 0; k < 3; k++) {
+      if (k < n_predict) {
+        can_contain_target = can_contain_target || (thread_targets[k] >= i * BLOCK_SIZE * VEC_WIDTH && 
+                                                    thread_targets[k] < (i + 1) * BLOCK_SIZE * VEC_WIDTH);
+      }
+    }
           
+    if (can_contain_target) {
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
       #pragma unroll 
       for (int j = 0; j < VEC_WIDTH; j++) {
         float sigmoid_u = __bfloat162float(sigmoid_us[j]);
@@ -532,6 +542,7 @@ __global__ void ce_fwd_bwd_kernel(
 
         float term1 = S_w * p;
         float term2 = 0.0f;
+
         #pragma unroll
         for (int k = 0; k < 3; k++) {
           int target_idx = blockIdx.x + k;
@@ -548,6 +559,26 @@ __global__ void ce_fwd_bwd_kernel(
         result[j] = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
       }
       *(__nv_fp8_e5m28*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = result;
+    }
+    } else {
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
+      #pragma unroll 
+      for (int j = 0; j < VEC_WIDTH; j++) {
+        float sigmoid_u = __bfloat162float(sigmoid_us[j]);
+        float z = A * sigmoid_u;
+        float p = __expf(z - lse);
+
+        float term1 = S_w * p;
+        float term2 = 0.0f;
+
+        float grad_z = term1 - term2;
+        float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+        auto result_tmp = __nv_cvt_float_to_fp8(grad_x, __NV_SATFINITE, __NV_E5M2);
+        result[j] = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+      }
+      *(__nv_fp8_e5m28*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = result;
+    }
     }
   }
 }
