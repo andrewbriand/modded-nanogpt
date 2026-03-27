@@ -415,7 +415,7 @@ __global__ void ce_fwd_bwd_kernel(
   float B_div_C = B * inv_C;
   float thread_max = -CUDART_INF_F;
 
-  #pragma unroll
+  #pragma unroll 25
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
@@ -453,7 +453,6 @@ __global__ void ce_fwd_bwd_kernel(
   }
 
   float thread_sum = 0.0f;
-  #pragma unroll
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     __nv_bfloat168 l;
@@ -519,7 +518,6 @@ __global__ void ce_fwd_bwd_kernel(
     }
   }
 
-  #pragma unroll
   for (int i = 0; i < NUM_LOADS; i++) {
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
@@ -562,7 +560,7 @@ t0 = time.perf_counter()
 ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
     "ce_fwd_bwd_kernel",
-    compute_capability="90",
+    compute_capability="89",
     cuda_include_dirs=["/usr/local/cuda/include/"],
     nvcc_options=["-lineinfo", "--use_fast_math"],
 )
