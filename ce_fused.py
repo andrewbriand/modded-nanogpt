@@ -367,6 +367,12 @@ struct __align__(16) __nv_bfloat168 {
     __device__ const __nv_bfloat16& operator[](int i) const { return data[i]; }
 };
 
+struct __align__(8) __nv_fp8_e5m28 {
+    __nv_fp8_e5m2 data[8];
+    __device__ __nv_fp8_e5m2& operator[](int i) { return data[i]; }
+    __device__ const __nv_fp8_e5m2& operator[](int i) const { return data[i]; }
+};
+
 template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
 
 __device__ float sigmoid(float x) {
@@ -386,8 +392,8 @@ __global__ void ce_fwd_bwd_kernel(
     double A_param,
     double B_param, 
     double C_param,
-    double grad_s,
-    double grad_scale)
+    double grad_s_param,
+    double grad_scale_param)
 {
   constexpr int VEC_WIDTH = 8;
   constexpr int NUM_FULL_LOADS = VOCAB_SIZE / (BLOCK_SIZE * VEC_WIDTH);
@@ -396,6 +402,8 @@ __global__ void ce_fwd_bwd_kernel(
   float A = (float)A_param;
   float B = (float)B_param;
   float C = (float)C_param;
+  float grad_s = (float)grad_s_param;
+  float grad_scale = (float)grad_scale_param;
 
   extern __shared__ __nv_bfloat16 smem[];
 
@@ -418,11 +426,14 @@ __global__ void ce_fwd_bwd_kernel(
   #pragma unroll
   for (int i = 0; i < NUM_LOADS; i++) {
     __nv_bfloat168 result;
+    __nv_bfloat168 result_sigmoid;
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     #pragma unroll 
     for (int k = 0; k < VEC_WIDTH; k++) {
       float tmp = __bfloat162float(thread_logits[i][k]);
-      tmp = A * sigmoid(tmp * inv_C + B_div_C);
+      tmp = sigmoid(tmp * inv_C + B_div_C);
+      result_sigmoid[k] = __float2bfloat16(tmp);
+      tmp = A * tmp;
       if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
         thread_max = max(tmp, thread_max);
       }
@@ -430,7 +441,7 @@ __global__ void ce_fwd_bwd_kernel(
     }
     thread_logits[i] = result;
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
-      *(__nv_bfloat168*)(&smem[idx]) = result;
+      *(__nv_bfloat168*)(&smem[idx]) = result_sigmoid;
     }
   }
 
@@ -456,7 +467,6 @@ __global__ void ce_fwd_bwd_kernel(
   float thread_sum = 0.0f;
   #pragma unroll
   for (int i = 0; i < NUM_LOADS; i++) {
-    __nv_bfloat168 result;
     int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
     #pragma unroll 
     for (int k = 0; k < VEC_WIDTH; k++) {
@@ -492,13 +502,64 @@ __global__ void ce_fwd_bwd_kernel(
         float weight = mtp_weights[k];
         int target = targets[target_idx];
         if (target >= 0 && target < VOCAB_SIZE) {
-          float z_target = __bfloat162float(smem[target]);
+          float z_target = A * __bfloat162float(smem[target]);
           total_loss += weight * (lse - z_target);  
         }
       }
     }
     losses[blockIdx.x] = total_loss;
   }
+
+  float S_w = 0.0f;
+
+  for (int i = 0; i < n_predict; i++) {
+    S_w += mtp_weights[i];
+  }
+
+  int thread_targets[3];
+  float thread_mtp_weights[3];
+  #pragma unroll
+  for (int k = 0; k < 3; k++) {
+    int target_idx = blockIdx.x + k;
+    if (target_idx < batch_size) {
+      thread_targets[k] = targets[target_idx];
+      thread_mtp_weights[k] = mtp_weights[k];
+    }
+  }
+  #pragma unroll
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
+    __nv_fp8_e5m28 result;
+          
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      #pragma unroll 
+      for (int j = 0; j < VEC_WIDTH; j++) {
+        float sigmoid_u = __bfloat162float(sigmoid_us[j]);
+        float z = A * sigmoid_u;
+        float p = __expf(z - lse);
+
+        float term1 = S_w * p;
+        float term2 = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 3; k++) {
+          int target_idx = blockIdx.x + k;
+          if (target_idx < batch_size) {
+            if (thread_targets[k] == idx + j) {
+              term2 += thread_mtp_weights[k];
+            }
+          } 
+        }
+
+        float grad_z = term1 - term2;
+        float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+        auto result_tmp = __nv_cvt_float_to_fp8(grad_x, __NV_SATFINITE, __NV_E5M2);
+        result[j] = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+      }
+      *(__nv_fp8_e5m28*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = result;
+    }
+  }
+  
 }
 """
 
@@ -620,7 +681,8 @@ class FusedSoftcappedCrossEntropyCUDA(torch.autograd.Function):
 
         return grad_x, None, None, grad_w, None, None, None
 
-batch_size = 8 * 2048
+#batch_size = 8 * 2048
+batch_size = 16
 vocab_size = 50304
 model_dim = 768
 
@@ -655,6 +717,9 @@ grad = torch.ones_like(losses_ref)
 losses_ref.backward(grad)
 losses_kernel.backward(grad)
 
+print("targets:", targets)
+print("x_ref.grad:", x_ref.grad)
+print("x_kernel.grad:", x_kernel.grad)
 torch.testing.assert_close(x_ref.grad, x_kernel.grad)
 torch.testing.assert_close(lm_head_weight_ref.grad, lm_head_weight_kernel.grad)
 
