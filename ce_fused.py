@@ -521,7 +521,7 @@ __global__ void ce_fwd_bwd_kernel(
   #pragma unroll
   for (int k = 0; k < 3; k++) {
     int target_idx = blockIdx.x + k;
-    if (target_idx < batch_size) {
+    if (target_idx < batch_size && k < n_predict) {
       thread_targets[k] = targets[target_idx];
       thread_mtp_weights[k] = mtp_weights[k];
     }
@@ -544,7 +544,7 @@ __global__ void ce_fwd_bwd_kernel(
         #pragma unroll
         for (int k = 0; k < 3; k++) {
           int target_idx = blockIdx.x + k;
-          if (target_idx < batch_size) {
+          if (target_idx < batch_size && k < n_predict) {
             if (thread_targets[k] == idx + j) {
               term2 += thread_mtp_weights[k];
             }
@@ -559,7 +559,6 @@ __global__ void ce_fwd_bwd_kernel(
       *(__nv_fp8_e5m28*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = result;
     }
   }
-  
 }
 """
 
@@ -690,6 +689,7 @@ dtype = torch.bfloat16
 x = torch.randn((batch_size, model_dim), dtype=dtype, device="cuda")
 targets = torch.randint(low=0, high=vocab_size+1, size=(batch_size,), dtype=torch.int32, device="cuda")
 mtp_weights = torch.randn((3,), dtype=torch.float32, device="cuda").abs()
+mtp_weights = mtp_weights / mtp_weights.norm()
 lm_head_weight = torch.randn((model_dim, vocab_size), dtype=dtype, device="cuda") / 10
 x_s = 100/488
 w_s = 1.6/448
