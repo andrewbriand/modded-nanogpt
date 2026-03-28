@@ -538,33 +538,32 @@ __global__ void ce_fwd_bwd_kernel(
 
   __syncthreads();
 
-  if (threadIdx.x == 0) {
-    for (int i = 0; i < n_predict && i + blockIdx.x < batch_size; i++) {
-      int target = targets[blockIdx.x + i];
+  if (threadIdx.x < n_predict && blockIdx.x + threadIdx.x < batch_size) {
+    int i = threadIdx.x;
+    int target = targets[blockIdx.x + i];
 
-      float sigmoid_u = __bfloat162float(smem[target]);
-      float z = A * sigmoid_u;
-      float p = __expf(z - lse);
+    float sigmoid_u = __bfloat162float(smem[target]);
+    float z = A * sigmoid_u;
+    float p = __expf(z - lse);
 
-      float term1 = S_w * p;
-      float term2 = 0.0f;
+    float term1 = S_w * p;
+    float term2 = 0.0f;
 
-      #pragma unroll
-      for (int k = 0; k < 3; k++) {
-        int target_idx = blockIdx.x + k;
-        if (target_idx < batch_size && k < n_predict) {
-          if (targets[target_idx] == target) {
-            term2 += mtp_weights[k];
-          }
-        } 
-      }
-
-      float grad_z = term1 - term2;
-      float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
-      auto result_tmp = __nv_cvt_float_to_fp8(grad_x, __NV_SATFINITE, __NV_E5M2);
-      auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
-      grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
+    #pragma unroll
+    for (int k = 0; k < 3; k++) {
+      int target_idx = blockIdx.x + k;
+      if (target_idx < batch_size && k < n_predict) {
+        if (targets[target_idx] == target) {
+          term2 += mtp_weights[k];
+        }
+      } 
     }
+
+    float grad_z = term1 - term2;
+    float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+    auto result_tmp = __nv_cvt_float_to_fp8(grad_x, __NV_SATFINITE, __NV_E5M2);
+    auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+    grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
   }
 }
 """
