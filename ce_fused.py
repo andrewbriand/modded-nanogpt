@@ -358,8 +358,23 @@ constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
 
 CE_KERNEL_SOURCE = """
 #include <cuda_bf16.h>
-#include <cuda_fp8.h>
 #include <math_constants.h>
+
+#define __nv_fp8_e5m2 char
+#define uint16_t unsigned short
+#define uint8_t unsigned char
+
+__device__ __forceinline__ __nv_fp8_e5m2 f32_to_fp8_e5m2(float x) {
+    uint16_t packed;
+    asm volatile(
+        "cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;"
+        : "=h"(packed)
+        : "f"(x), "f"(0.0f)
+    );
+    __nv_fp8_e5m2 result;
+    *reinterpret_cast<uint8_t*>(&result) = (packed & (0xFF << 8)) >> 8;
+    return result;
+}
 
 struct __align__(16) __nv_bfloat168 {
     __nv_bfloat16 data[8];
@@ -529,7 +544,7 @@ __global__ void ce_fwd_bwd_kernel(
 
         float grad_z = term1 - term2;
         float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
-        auto result_tmp = __nv_cvt_float_to_fp8(grad_x, __NV_SATFINITE, __NV_E5M2);
+        auto result_tmp = f32_to_fp8_e5m2(grad_x);
         result[j] = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
       }
       *(__nv_fp8_e5m28*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = result;
@@ -561,7 +576,7 @@ __global__ void ce_fwd_bwd_kernel(
 
     float grad_z = term1 - term2;
     float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
-    auto result_tmp = __nv_cvt_float_to_fp8(grad_x, __NV_SATFINITE, __NV_E5M2);
+    auto result_tmp = f32_to_fp8_e5m2(grad_x);
     auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
     grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
   }
