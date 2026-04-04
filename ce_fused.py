@@ -363,6 +363,7 @@ CE_KERNEL_SOURCE = """
 #define __nv_fp8_e5m2 char
 #define uint16_t unsigned short
 #define uint8_t unsigned char
+#define int64_t long long
 
 __device__ __forceinline__ __nv_fp8_e5m2 f32_to_fp8_e5m2(float x) {
     uint16_t packed;
@@ -401,14 +402,14 @@ extern "C"
 __launch_bounds__(BLOCK_SIZE, 2)
 __global__ void ce_fwd_bwd_kernel(
     const __nv_bfloat16* __restrict__ logits,
-    const int* __restrict__ targets,
+    const int64_t* __restrict__ targets,
     const float* __restrict__ mtp_weights,
     float* __restrict__ losses,
     __nv_fp8_e5m2* grad_input,
     int batch_size,
     int n_predict,
     double A_param,
-    double B_param, 
+    double B_param,
     double C_param,
     double grad_s_param,
     double grad_scale_param)
@@ -439,7 +440,7 @@ __global__ void ce_fwd_bwd_kernel(
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
       __nv_bfloat168 result = *(__nv_bfloat168*)(&block_logit_ptr[idx]);
       __nv_bfloat168 result_sigmoid;
-      #pragma unroll 
+      #pragma unroll
       for (int k = 0; k < VEC_WIDTH; k++) {
         float tmp = __bfloat162float(result[k]);
         tmp = sigmoid(tmp * inv_C + B_div_C);
@@ -478,7 +479,7 @@ __global__ void ce_fwd_bwd_kernel(
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
       l = *(__nv_bfloat168*)(&smem[idx]);
     }
-    #pragma unroll 
+    #pragma unroll
     for (int k = 0; k < VEC_WIDTH; k++) {
       float tmp = A * __bfloat162float(l[k]);
       tmp = __expf(tmp - block_max);
@@ -507,13 +508,13 @@ __global__ void ce_fwd_bwd_kernel(
   if (threadIdx.x == 0) {
     float total_loss = 0.0f;
     for (int k = 0; k < n_predict; k++) {
-      int target_idx = blockIdx.x + k;
+      int64_t target_idx = blockIdx.x + k;
       if (target_idx < batch_size) {
         float weight = mtp_weights[k];
-        int target = targets[target_idx];
+        int64_t target = targets[target_idx];
         if (target >= 0 && target < VOCAB_SIZE) {
           float z_target = A * __bfloat162float(smem[target]);
-          total_loss += weight * (lse - z_target);  
+          total_loss += weight * (lse - z_target);
         }
       }
     }
@@ -533,7 +534,7 @@ __global__ void ce_fwd_bwd_kernel(
 
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
       __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
-      #pragma unroll 
+      #pragma unroll
       for (int j = 0; j < VEC_WIDTH; j++) {
         float sigmoid_u = __bfloat162float(sigmoid_us[j]);
         float z = A * sigmoid_u;
@@ -555,7 +556,7 @@ __global__ void ce_fwd_bwd_kernel(
 
   if (threadIdx.x < n_predict && blockIdx.x + threadIdx.x < batch_size) {
     int i = threadIdx.x;
-    int target = targets[blockIdx.x + i];
+    int64_t target = targets[blockIdx.x + i];
 
     float sigmoid_u = __bfloat162float(smem[target]);
     float z = A * sigmoid_u;
@@ -566,12 +567,12 @@ __global__ void ce_fwd_bwd_kernel(
 
     #pragma unroll
     for (int k = 0; k < 3; k++) {
-      int target_idx = blockIdx.x + k;
+      int64_t target_idx = blockIdx.x + k;
       if (target_idx < batch_size && k < n_predict) {
         if (targets[target_idx] == target) {
           term2 += mtp_weights[k];
         }
-      } 
+      }
     }
 
     float grad_z = term1 - term2;
@@ -701,14 +702,14 @@ class FusedSoftcappedCrossEntropyCUDA(torch.autograd.Function):
 
         return grad_x, None, None, grad_w, None, None, None
 
-batch_size = 8 * 2048
+batch_size = 3 * 8 * 2048
 vocab_size = 50304
 model_dim = 768
 
 dtype = torch.bfloat16
 
 x = torch.randn((batch_size, model_dim), dtype=dtype, device="cuda")
-targets = torch.randint(low=0, high=vocab_size+1, size=(batch_size,), dtype=torch.int32, device="cuda")
+targets = torch.randint(low=0, high=vocab_size+1, size=(batch_size,), dtype=torch.int64, device="cuda")
 mtp_weights = torch.randn((3,), dtype=torch.float32, device="cuda").abs()
 mtp_weights = mtp_weights / mtp_weights.norm()
 lm_head_weight = torch.randn((model_dim, vocab_size), dtype=dtype, device="cuda") / 10
