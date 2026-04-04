@@ -845,7 +845,7 @@ __global__ void ce_fwd_bwd_kernel(
     int batch_size,
     int n_predict,
     double A_param,
-    double B_param, 
+    double B_param,
     double C_param,
     double grad_s_param,
     double grad_scale_param)
@@ -876,7 +876,7 @@ __global__ void ce_fwd_bwd_kernel(
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
       __nv_bfloat168 result = *(__nv_bfloat168*)(&block_logit_ptr[idx]);
       __nv_bfloat168 result_sigmoid;
-      #pragma unroll 
+      #pragma unroll
       for (int k = 0; k < VEC_WIDTH; k++) {
         float tmp = __bfloat162float(result[k]);
         tmp = sigmoid(tmp * inv_C + B_div_C);
@@ -915,7 +915,7 @@ __global__ void ce_fwd_bwd_kernel(
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
       l = *(__nv_bfloat168*)(&smem[idx]);
     }
-    #pragma unroll 
+    #pragma unroll
     for (int k = 0; k < VEC_WIDTH; k++) {
       float tmp = A * __bfloat162float(l[k]);
       tmp = __expf(tmp - block_max);
@@ -950,7 +950,7 @@ __global__ void ce_fwd_bwd_kernel(
         int64_t target = targets[target_idx];
         if (target >= 0 && target < VOCAB_SIZE) {
           float z_target = A * __bfloat162float(smem[target]);
-          total_loss += weight * (lse - z_target);  
+          total_loss += weight * (lse - z_target);
         }
       }
     }
@@ -970,7 +970,7 @@ __global__ void ce_fwd_bwd_kernel(
 
     if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
       __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
-      #pragma unroll 
+      #pragma unroll
       for (int j = 0; j < VEC_WIDTH; j++) {
         float sigmoid_u = __bfloat162float(sigmoid_us[j]);
         float z = A * sigmoid_u;
@@ -1008,7 +1008,7 @@ __global__ void ce_fwd_bwd_kernel(
         if (targets[target_idx] == target) {
           term2 += mtp_weights[k];
         }
-      } 
+      }
     }
 
     float grad_z = term1 - term2;
@@ -1088,22 +1088,15 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
         ce_fwd_bwd(logits, targets, mtp_weights, losses, grad_input,
              n_rows, n_predict, A, B, C, grad_s, grad_scale)
-        #ce_fwd_bwd_kernel(
-        #    grid,
-        #    (CE_KERNEL_BLOCK_SIZE, 1, 1),
-        #    (logits, targets, mtp_weights, losses, grad_input,
-        #     n_rows, n_predict, A, B, C, grad_s, grad_scale),
-        #    shared_mem=CE_KERNEL_VOCAB_SIZE*2
+        #grid = (n_rows,)
+        #fused_softcapped_entropy_fwd_kernel[grid](
+        #    logits, losses, lse, targets, mtp_weights,
+        #    logits.stride(0), logits.stride(1),
+        #    n_rows, n_cols, n_predict,
+        #    A, B, C,
+        #    BLOCK_SIZE=2048,
+        #    num_warps=2
         #)
-        grid = (n_rows,)
-        fused_softcapped_entropy_fwd_kernel[grid](
-            logits, losses, lse, targets, mtp_weights,
-            logits.stride(0), logits.stride(1),
-            n_rows, n_cols, n_predict,
-            A, B, C,
-            BLOCK_SIZE=2048,
-            num_warps=2
-        )
 
         ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input)
         ctx.params = (A, B, C, x_s, w_s, grad_s)
@@ -1118,22 +1111,18 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
         grad_output = grad_output.contiguous()
 
-        grad_input_ref = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
-        grid = (n_rows,)
-        fused_softcapped_entropy_bwd_kernel[grid](
-            grad_input_ref, grad_output, lse, logits, targets, mtp_weights,
-            logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
-            n_rows, n_cols, n_predict,
-            A, B, C,
-            grad_s,
-            BLOCK_SIZE=1024,
-            num_warps=4,
-            N_PREDICT=n_predict,
-        )
-
-        print("grad_input:", grad_input)
-        print("grad_input_ref:", grad_input_ref)
-        torch.testing.assert_close(grad_input, grad_input_ref)
+        #grad_input_ref = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
+        #grid = (n_rows,)
+        #fused_softcapped_entropy_bwd_kernel[grid](
+        #    grad_input_ref, grad_output, lse, logits, targets, mtp_weights,
+        #    logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
+        #    n_rows, n_cols, n_predict,
+        #    A, B, C,
+        #    grad_s,
+        #    BLOCK_SIZE=1024,
+        #    num_warps=4,
+        #    N_PREDICT=n_predict,
+        #)
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
         w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)

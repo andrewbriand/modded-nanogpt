@@ -47,7 +47,7 @@ dynamo.config.recompile_limit = 64
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 * 8 // world_size
+grad_accum_steps = 8 // world_size
 grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -1887,7 +1887,7 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-#model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 
