@@ -2076,9 +2076,23 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
+
+cuda_profiler_start_step = None
+cuda_profiler_stop_step = None
+if "CUDA_PROFILER_START_STEP" in os.environ and "CUDA_PROFILER_STOP_STEP" in os.environ:
+    cuda_profiler_start_step = int(os.environ["CUDA_PROFILER_START_STEP"])
+    cuda_profiler_stop_step = int(os.environ["CUDA_PROFILER_STOP_STEP"])
+
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
+
+    if cuda_profiler_start_step is not None and cuda_profiler_stop_step is not None:
+        if step == cuda_profiler_start_step:
+            torch.cuda.profiler.start()
+        if step == cuda_profiler_stop_step:
+            torch.cuda.profiler.stop()
+
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
